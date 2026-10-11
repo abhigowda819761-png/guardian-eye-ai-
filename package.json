@@ -1,0 +1,16 @@
+{
+  "name": "guardian-eye-ai",
+  "version": "1.0.0",
+  "private": true,
+  "description": "GuardianEye AI - AI-Powered Meeting Analysis Platform",
+  "scripts": {
+    "dev": "npm run dev --prefix frontend",
+    "dev:frontend": "npm run dev --prefix frontend",
+    "backend": "./backend/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 --app-dir backend --reload",
+    "build": "npm run build --prefix frontend",
+    "lint": "npm run lint --prefix frontend"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
