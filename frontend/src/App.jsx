@@ -22,6 +22,7 @@ import {
 import logoImg from './assets/logo.png';
 import MeetingRoom from './MeetingRoom';
 import AnalysisReport from './AnalysisReport';
+import { API_BASE_URL, WS_BASE_URL } from './config';
 import {
   loginUser,
   registerUser,
@@ -259,8 +260,7 @@ function App() {
     setIsRequestSent(true);
 
     try {
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const socket = new WebSocket(`${protocol}//${window.location.hostname}:8000/ws/meeting/${cleanCode}`);
+      const socket = new WebSocket(`${WS_BASE_URL}/ws/meeting/${cleanCode}`);
       participantWsRef.current = socket;
 
       socket.onopen = () => {
@@ -388,7 +388,7 @@ function App() {
 
     try {
       const xhr = new XMLHttpRequest();
-      xhr.open('POST', 'http://localhost:8000/api/video/extract-audio', true);
+      xhr.open('POST', `${API_BASE_URL}/api/video/extract-audio`, true);
 
       xhr.upload.onprogress = (evt) => {
         if (evt.lengthComputable) {
@@ -462,7 +462,7 @@ function App() {
 
       xhr.onerror = () => {
         setIsUploading(false);
-        alert("Failed to communicate with GuardianEye AI backend at http://localhost:8000");
+        alert(`Failed to communicate with GuardianEye AI backend at ${API_BASE_URL}`);
       };
 
       xhr.send(formData);

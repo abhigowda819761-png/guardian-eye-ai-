@@ -21,6 +21,7 @@ import {
   uploadBytesResumable,
   getDownloadURL
 } from 'firebase/storage';
+import { API_BASE_URL } from './config';
 
 const firebaseConfig = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY || "",
@@ -105,9 +106,9 @@ export async function loginUser(emailOrUsername, password) {
     }
   }
 
-  // 2. Connect to FastAPI backend server (port 8000) with SQLite + Bcrypt security
+  // 2. Connect to FastAPI backend server with SQLite + Bcrypt security
   try {
-    const res = await fetch('http://localhost:8000/api/auth/login', {
+    const res = await fetch(`${API_BASE_URL}/api/auth/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ email: cleanEmail, password: pwd })
@@ -182,7 +183,7 @@ export async function registerUser(email, password, displayName = '') {
 
   // 2. FastAPI backend
   try {
-    const res = await fetch('http://localhost:8000/api/auth/register', {
+    const res = await fetch(`${API_BASE_URL}/api/auth/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ email: cleanEmail, password: pwd, displayName })

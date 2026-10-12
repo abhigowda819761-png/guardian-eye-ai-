@@ -19,6 +19,7 @@ import {
   TrendingUp,
   Award
 } from 'lucide-react';
+import { API_BASE_URL } from './config';
 import './AnalysisReport.css';
 
 function AnalysisReport({ videoTitle, audioData, onBack }) {
@@ -273,7 +274,7 @@ function AnalysisReport({ videoTitle, audioData, onBack }) {
   const getFullAudioSrc = (urlPath) => {
     if (!urlPath) return '';
     if (urlPath.startsWith('http')) return urlPath;
-    return `http://localhost:8000${urlPath}`;
+    return `${API_BASE_URL}${urlPath}`;
   };
 
   const handlePlayToggle = (audioUrl) => {
@@ -307,7 +308,7 @@ function AnalysisReport({ videoTitle, audioData, onBack }) {
 
     setIsVerifying(true);
     try {
-      const res = await fetch('http://localhost:8000/api/ai/fact-check', {
+      const res = await fetch(`${API_BASE_URL}/api/ai/fact-check`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ claim: factCheckText.trim() })

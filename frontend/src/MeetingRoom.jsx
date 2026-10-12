@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import './MeetingRoom.css';
+import { WS_BASE_URL } from './config';
 import {
   Video,
   VideoOff,
@@ -236,8 +237,7 @@ function MeetingRoom({
   // Real-Time WebSocket Signaling & WebRTC Mesh Setup
   useEffect(() => {
     let isCancelled = false;
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.hostname}:8000/ws/meeting/${meetingCode}`;
+    const wsUrl = `${WS_BASE_URL}/ws/meeting/${meetingCode}`;
 
     try {
       const socket = new WebSocket(wsUrl);
