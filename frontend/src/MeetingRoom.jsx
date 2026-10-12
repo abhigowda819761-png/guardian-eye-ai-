@@ -514,9 +514,12 @@ function MeetingRoom({
     setJoinRequests((prev) => prev.filter((r) => r.id !== id));
   }, [sendWs]);
 
-  // Copy Meeting Code
+  // Copy Meeting Code or Full Direct Join Link
   const copyCode = useCallback(() => {
-    navigator.clipboard.writeText(meetingCode).catch(() => {});
+    const inviteLink = `${window.location.origin}/?join=${meetingCode}`;
+    navigator.clipboard.writeText(inviteLink).catch(() => {
+      navigator.clipboard.writeText(meetingCode).catch(() => {});
+    });
     setCodeCopied(true);
     setTimeout(() => setCodeCopied(false), 2000);
   }, [meetingCode]);
@@ -548,8 +551,8 @@ function MeetingRoom({
     <div className="meeting-room">
       {/* Top Overlay: Room Information & Code */}
       <div className="meeting-code-overlay">
-        <div className="meeting-code-badge" onClick={copyCode} title="Click to copy meeting code">
-          <span className="code-label">Meeting Code</span>
+        <div className="meeting-code-badge" onClick={copyCode} title="Click to copy full invite link for other devices">
+          <span className="code-label">{codeCopied ? 'Link Copied!' : 'Meeting Code'}</span>
           <span className="code-value">{meetingCode}</span>
           {codeCopied ? <Check size={14} className="code-copy-icon" /> : <Copy size={14} className="code-copy-icon" />}
         </div>

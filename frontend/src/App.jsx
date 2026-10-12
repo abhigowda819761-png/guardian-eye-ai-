@@ -174,7 +174,12 @@ function App() {
             clearInterval(timer);
             // After 3 seconds of loading, transition to login or dashboard
             setTimeout(() => {
-              if (hostName) {
+              const urlParams = new URLSearchParams(window.location.search);
+              const joinCode = urlParams.get('join') || urlParams.get('room');
+              if (joinCode) {
+                setMeetingCodeInput(joinCode.toUpperCase());
+                setPhase('participant');
+              } else if (hostName) {
                 setPhase('dashboard');
               } else {
                 setPhase('role-selection');
