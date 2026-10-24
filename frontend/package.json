@@ -16,6 +16,7 @@
   "dependencies": {
     "@capacitor/android": "^8.5.3",
     "@capacitor/core": "^8.5.3",
+    "axios": "^1.20.0",
     "firebase": "^13.0.0",
     "html2canvas": "^1.4.1",
     "jspdf": "^4.2.1",
