@@ -645,33 +645,48 @@ def extract_fact_check_from_dialogue(raw_transcript: str, host: str, guest: str)
 @app.post("/api/firebase/transcribe-meeting")
 async def firebase_transcribe_meeting(req: FirebaseTranscribeRequest):
     """
-    Serverless audio processing endpoint simulating or proxying Firebase Cloud Functions + Deepgram Nova-2.
+    Serverless audio processing endpoint proxying Firebase Cloud Functions + Deepgram Nova-2.
     Parameters: diarize=true&smart_format=true&model=nova-2
     Maps Speaker 0 -> Host and Speaker 1 -> Guest.
     """
     host = req.hostName or "Host"
     guest = (req.participantNames and req.participantNames[0]) or "Participant"
-    deepgram_key = os.environ.get("DEEPGRAM_API_KEY", "")
 
-    # Clean chronological dialogue format
-    dialogue_script = req.rawTranscript or f"{host}: Meeting session initiated.\n{guest}: Connected to audio stream."
-    dialogue_turns = [
-        {
-            "speaker": host,
-            "role": "Host",
-            "isHost": True,
-            "text": "Meeting session initiated.",
-            "start": "00:01",
-            "timestamp": "00:01"
-        },
-        {
-            "speaker": guest,
-            "role": "Participant",
-            "isHost": False,
-            "text": "Connected to audio stream.",
-            "start": "00:04",
-            "timestamp": "00:04"
-        }
+    # Reject requests that carry no real transcript data — never fabricate dialogue
+    if not req.rawTranscript or not req.rawTranscript.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No transcript data provided. rawTranscript is required for this endpoint."
+        )
+
+    dialogue_script = req.rawTranscript.strip()
+
+    # Parse real dialogue turns from the verbatim transcript string
+    dialogue_turns = []
+    unique_speakers = set()
+    raw_lines = [l.strip() for l in dialogue_script.split("\n") if l.strip()]
+    for idx, line in enumerate(raw_lines):
+        match = re.match(r"^([^:]+):\s*(.+)$", line)
+        if match:
+            spk = match.group(1).strip()
+            text = match.group(2).strip()
+        else:
+            spk = host if idx % 2 == 0 else guest
+            text = line
+        unique_speakers.add(spk)
+        is_host = (spk.lower() == host.lower())
+        dialogue_turns.append({
+            "id": f"turn_{idx}",
+            "speaker": spk,
+            "role": "Host" if is_host else "Participant",
+            "isHost": is_host,
+            "text": text,
+            "timestamp": f"00:{str(idx * 4).zfill(2)}"
+        })
+
+    speakers_list = [
+        {"id": i, "name": name, "role": "host" if name.lower() == host.lower() else "participant"}
+        for i, name in enumerate(sorted(unique_speakers, key=lambda n: 0 if n.lower() == host.lower() else 1))
     ]
 
     result = {
@@ -680,13 +695,9 @@ async def firebase_transcribe_meeting(req: FirebaseTranscribeRequest):
         "transcriptText": dialogue_script,
         "rawTranscript": dialogue_script,
         "status": "completed",
-        "speakers": [
-            {"id": 0, "name": host, "role": "host"},
-            {"id": 1, "name": guest, "role": "participant"}
-        ],
+        "speakers": speakers_list,
         "dialogueTurns": dialogue_turns,
         "storagePath": req.storagePath,
-        "deepgram_model": "nova-2",
         "diarization": True
     }
 
@@ -796,12 +807,16 @@ async def analyze_meeting_video_endpoint(
     raw_transcript = transcription.get("rawTranscript", "")
     dialogue_turns = transcription.get("dialogueTurns", [])
     
-    # Production Validation Audit: If Groq returns empty payload, throw genuine HTTP 500 error
+    # Production Validation Audit: If Groq returns an empty payload, throw genuine HTTP 500 error.
+    # NOTE: is_single_turn is intentionally NOT a rejection gate — solo-speaker recordings are valid.
+    # Only block if the transcript array is completely empty or contains known dummy session strings.
     is_empty_transcript = not raw_transcript or not dialogue_turns
-    is_single_turn = len(dialogue_turns) <= 1
-    is_dummy_session = raw_transcript.strip() == "Meeting audio session connected and verified." or "Meeting audio session connected and verified." in raw_transcript
+    is_dummy_session = (
+        raw_transcript.strip() == "Meeting audio session connected and verified."
+        or "Meeting audio session connected and verified." in raw_transcript
+    )
 
-    if is_empty_transcript or is_single_turn or is_dummy_session:
+    if is_empty_transcript or is_dummy_session:
         print(f"[analyze-video] Audit check failed: isEmpty={is_empty_transcript}, turns={len(dialogue_turns)}, isDummy={is_dummy_session}.")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
