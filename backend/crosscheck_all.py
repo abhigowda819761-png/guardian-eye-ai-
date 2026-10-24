@@ -30,9 +30,14 @@ def run_crosscheck():
     # -------------------------------------------------------------
     # Step 1: Synthesize a realistic 3-speaker video
     # -------------------------------------------------------------
-    sr = 16000
-    ffmpeg = shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
-    assert os.path.exists(ffmpeg), f"FFmpeg not found at {ffmpeg}"
+    ffmpeg = (
+        os.environ.get("FFMPEG_PATH") or
+        shutil.which("ffmpeg") or
+        next((p for p in ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"] if os.path.exists(p)), None) or
+        "ffmpeg"
+    )
+    if ffmpeg != "ffmpeg":
+        assert os.path.exists(ffmpeg), f"FFmpeg not found at {ffmpeg}"
 
     # Speaker 1 (Abhishek - Host): 135 Hz pitch, 3.0s
     t1 = np.linspace(0, 3.0, int(sr * 3.0))

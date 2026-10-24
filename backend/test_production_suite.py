@@ -54,9 +54,13 @@ def http_get(url: str):
 # 1. FFmpeg & MP4 Video Generation
 # ==========================================
 def test_ffmpeg_and_mp4_generation():
-    print("\n--- TEST 1: FFmpeg & Real MP4 Extraction ---")
-    ffmpeg = shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
-    if not os.path.exists(ffmpeg):
+    ffmpeg = (
+        os.environ.get("FFMPEG_PATH") or
+        shutil.which("ffmpeg") or
+        next((p for p in ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"] if os.path.exists(p)), None) or
+        "ffmpeg"
+    )
+    if ffmpeg != "ffmpeg" and not os.path.exists(ffmpeg):
         record_test("FFmpeg Presence", False, f"FFmpeg not found at {ffmpeg}")
         return None
 

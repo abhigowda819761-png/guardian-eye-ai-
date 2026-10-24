@@ -9,13 +9,51 @@ from scipy.signal import find_peaks
 from typing import Dict, List, Any, Tuple, Optional
 from speech_analytics import analyze_speaker_acoustics, generate_meeting_insights
 
-# Locate FFmpeg binary
-FFMPEG_BIN = shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
-if not os.path.exists(FFMPEG_BIN) and shutil.which("ffmpeg"):
-    FFMPEG_BIN = shutil.which("ffmpeg")
+import tempfile
 
-UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "uploads")
-AUDIO_OUTPUT_DIR = os.path.join(UPLOAD_DIR, "audio")
+# ----------------------------------------------------
+# Dynamic FFmpeg Resolution (Absolute Linux/Render/macOS Path)
+# ----------------------------------------------------
+def get_ffmpeg_binary() -> str:
+    """
+    Resolves the system's ffmpeg executable using absolute paths or PATH lookup.
+    Prioritizes standard Linux locations used by Render's Debian/Ubuntu containers.
+    """
+    # 1. Custom environment variable override
+    env_ffmpeg = os.environ.get("FFMPEG_PATH") or os.environ.get("FFMPEG_BIN")
+    if env_ffmpeg and os.path.exists(env_ffmpeg):
+        return env_ffmpeg
+
+    # 2. Lookup via system PATH (e.g., /usr/bin/ffmpeg)
+    which_ffmpeg = shutil.which("ffmpeg")
+    if which_ffmpeg and os.path.exists(which_ffmpeg):
+        return which_ffmpeg
+
+    # 3. Known system locations (Linux Render container vs macOS Homebrew)
+    candidates = [
+        "/usr/bin/ffmpeg",             # Default Debian/Ubuntu apt install location
+        "/usr/local/bin/ffmpeg",       # Common compiled/custom location
+        "/bin/ffmpeg",                 # Core binary path
+        "/opt/homebrew/bin/ffmpeg",    # macOS Apple Silicon
+        "/usr/local/opt/ffmpeg/bin/ffmpeg" # macOS Intel
+    ]
+    for path in candidates:
+        if os.path.exists(path) and os.access(path, os.X_OK):
+            return path
+
+    # 4. Fallback to command name for smooth PATH execution
+    return which_ffmpeg or "ffmpeg"
+
+FFMPEG_BIN = get_ffmpeg_binary()
+
+# ----------------------------------------------------
+# Standard Temporary Storage (/tmp for Render container safety)
+# ----------------------------------------------------
+SYSTEM_TEMP_DIR = os.path.abspath(tempfile.gettempdir())
+UPLOAD_DIR = os.path.join(SYSTEM_TEMP_DIR, "guardianeye_uploads")
+AUDIO_OUTPUT_DIR = os.path.join(SYSTEM_TEMP_DIR, "guardianeye_audio")
+
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(AUDIO_OUTPUT_DIR, exist_ok=True)
 
 def format_timestamp(seconds: float) -> str:
@@ -27,36 +65,64 @@ def format_timestamp(seconds: float) -> str:
 def extract_master_wav_from_video(video_path: str, output_wav_path: str) -> bool:
     """
     Extracts a 16kHz, 16-bit mono PCM WAV audio track from the video file using FFmpeg.
-    This format is optimal for spectral analysis and speech processing.
+    Enforces absolute path tracking, /tmp temporary file guarantees, and smooth subprocess execution.
     """
-    if not os.path.exists(FFMPEG_BIN):
-        raise RuntimeError(f"FFmpeg binary not found at {FFMPEG_BIN}")
+    abs_video = os.path.abspath(video_path)
+    abs_output = os.path.abspath(output_wav_path)
+    os.makedirs(os.path.dirname(abs_output), exist_ok=True)
+
+    if not os.path.exists(abs_video) or os.path.getsize(abs_video) == 0:
+        raise RuntimeError(f"Input video file is missing or empty at {abs_video}")
+
+    ffmpeg_bin = get_ffmpeg_binary()
+    print(f"[audio_extractor] Invoking FFmpeg: {ffmpeg_bin} -> {abs_output} (from {abs_video}, {os.path.getsize(abs_video)} bytes)")
 
     cmd = [
-        FFMPEG_BIN,
-        "-y",               # Overwrite output
-        "-i", video_path,   # Input video
-        "-vn",              # Disable video recording
+        ffmpeg_bin,
+        "-y",                   # Overwrite output
+        "-i", abs_video,        # Input video
+        "-vn",                  # Disable video recording
         "-acodec", "pcm_s16le", # Uncompressed 16-bit PCM
-        "-ar", "16000",     # 16,000 Hz sample rate
-        "-ac", "1",         # Mono audio
-        output_wav_path
+        "-ar", "16000",         # 16,000 Hz sample rate
+        "-ac", "1",             # Mono audio
+        abs_output
     ]
 
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=120
+        )
+    except FileNotFoundError:
+        print(f"[audio_extractor] Binary {ffmpeg_bin} not found, falling back to 'ffmpeg' via PATH")
+        cmd[0] = "ffmpeg"
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=120
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("FFmpeg extraction timed out after 120 seconds.")
+
     if result.returncode != 0:
         error_msg = result.stderr.decode('utf-8', errors='ignore')
-        if "does not contain any stream" in error_msg or "matches no streams" in error_msg:
-            # Create a 3-second empty wav if video has no audio
-            with wave.open(output_wav_path, "wb") as wf:
+        if "does not contain any stream" in error_msg or "matches no streams" in error_msg or "Invalid data found" in error_msg:
+            print(f"[audio_extractor] Notice: No audio stream found in video ({error_msg[:100]}). Generating silent 3s WAV.")
+            with wave.open(abs_output, "wb") as wf:
                 wf.setnchannels(1)
                 wf.setsampwidth(2)
                 wf.setframerate(16000)
                 wf.writeframes(b"\x00" * 32000 * 3)
         else:
-            raise RuntimeError(f"FFmpeg audio extraction failed: {error_msg}")
-    
-    return os.path.exists(output_wav_path)
+            raise RuntimeError(f"FFmpeg audio extraction failed (code {result.returncode}): {error_msg}")
+
+    if not os.path.exists(abs_output) or os.path.getsize(abs_output) == 0:
+        raise RuntimeError(f"Extracted audio file is missing or 0 bytes at {abs_output}")
+
+    return True
 
 def load_wav_samples(wav_path: str) -> Tuple[np.ndarray, int]:
     """Reads uncompressed WAV file into normalized float32 numpy array and sample rate."""
@@ -286,6 +352,43 @@ def create_speaker_consolidated_wav(src_wav: str, dest_wav: str, intervals: List
         w.setframerate(framerate)
         w.writeframes(bytes(combined_frames))
 
+def transcribe_master_with_groq(wav_path: str) -> List[Dict[str, Any]]:
+    """
+    Rapidly transcribes the master WAV file using Groq Whisper Large-V3 in a single API call.
+    Zero local CPU/RAM overhead; prevents Render 512MB free tier OOM crashes.
+    """
+    groq_key = os.environ.get("GROQ_API_KEY", "").strip()
+    if not groq_key or not os.path.exists(wav_path) or os.path.getsize(wav_path) < 1000:
+        return []
+
+    try:
+        import httpx
+        with open(wav_path, "rb") as f:
+            files = {"file": (os.path.basename(wav_path), f, "audio/wav")}
+            data = {
+                "model": "whisper-large-v3",
+                "response_format": "verbose_json",
+                "temperature": "0.0"
+            }
+            headers = {"Authorization": f"Bearer {groq_key}"}
+            with httpx.Client(timeout=45.0) as client:
+                resp = client.post(
+                    "https://api.groq.com/openai/v1/audio/transcriptions",
+                    files=files,
+                    data=data,
+                    headers=headers
+                )
+                if resp.status_code == 200:
+                    payload = resp.json()
+                    segments = payload.get("segments", [])
+                    print(f"[audio_extractor] Groq transcribed master WAV into {len(segments)} segments.")
+                    return segments
+                else:
+                    print(f"[audio_extractor] Groq API returned status {resp.status_code}: {resp.text[:120]}")
+    except Exception as e:
+        print(f"[audio_extractor] Groq transcription notice: {e}")
+    return []
+
 def process_video_diarization(
     video_path: str,
     video_id: str,
@@ -294,7 +397,7 @@ def process_video_diarization(
 ) -> Dict[str, Any]:
     """
     Main Pipeline:
-    1. Extracts master 16kHz WAV from video via FFmpeg.
+    1. Extracts master 16kHz WAV from video via FFmpeg in /tmp.
     2. Runs Voice Activity Detection to find who spoke when.
     3. Extracts voice embeddings and clusters by speaker.
     4. Slices individual audio clips for every speaker turn.
@@ -348,7 +451,10 @@ def process_video_diarization(
     for i in range(len(names_pool), 10):
         names_pool.append(f"Participant {i}")
 
-    # Step 4: Organize turns and slice audio files
+    # Step 4: Rapid transcription pass (Groq Cloud if available)
+    groq_segments = transcribe_master_with_groq(master_wav_path)
+
+    # Step 5: Organize turns and slice audio files
     speakers_dict: Dict[int, dict] = {}
     chronological_timeline: List[dict] = []
     total_speech_time = 0.0
@@ -366,16 +472,28 @@ def process_video_diarization(
         spk_name = names_pool[spk_id] if spk_id < len(names_pool) else f"Participant {spk_id}"
         spk_role = "Host" if spk_id == 0 else "Participant"
 
-        # Transcribe or contextually annotate turn text
+        # Transcribe turn: Priority 1 = Groq segments matching timestamp
         turn_text = ""
-        try:
-            from diarizer import get_whisper_model
-            model = get_whisper_model("base")
-            if model is not None and os.path.exists(turn_path) and os.path.getsize(turn_path) > 1000:
-                res = model.transcribe(turn_path, fp16=False, language="en")
-                turn_text = res.get("text", "").strip()
-        except Exception:
-            pass
+        if groq_segments:
+            overlapping = [
+                seg.get("text", "").strip()
+                for seg in groq_segments
+                if max(start, float(seg.get("start", 0.0))) < min(end, float(seg.get("end", end)))
+                and seg.get("text", "").strip()
+            ]
+            if overlapping:
+                turn_text = " ".join(overlapping)
+
+        # Priority 2: Local Whisper ONLY if explicitly enabled (to protect 512MB RAM from OOM)
+        if not turn_text and os.environ.get("USE_LOCAL_WHISPER", "").lower() == "true":
+            try:
+                from diarizer import get_whisper_model
+                model = get_whisper_model("tiny")
+                if model is not None and os.path.exists(turn_path) and os.path.getsize(turn_path) > 1000:
+                    res = model.transcribe(turn_path, fp16=False, language="en")
+                    turn_text = res.get("text", "").strip()
+            except Exception:
+                pass
 
         if not turn_text:
             context_dialogues = [

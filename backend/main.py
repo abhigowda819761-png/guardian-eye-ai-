@@ -370,6 +370,11 @@ async def extract_audio_from_video(
         with open(temp_video_path, "wb") as buffer:
             while chunk := await file.read(1024 * 1024): # 1MB chunks
                 buffer.write(chunk)
+            buffer.flush()
+            os.fsync(buffer.fileno())
+
+        if not os.path.exists(temp_video_path) or os.path.getsize(temp_video_path) == 0:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty (0 bytes).")
 
         # Parse participant names if provided (comma-separated or JSON list)
         parsed_participants = []
@@ -382,8 +387,10 @@ async def extract_audio_from_video(
             except Exception:
                 parsed_participants = [p.strip() for p in participant_names.split(",") if p.strip()]
 
-        # Process audio extraction & speaker diarization with role attribution
-        analysis_result = process_video_diarization(
+        # Process audio extraction & speaker diarization off the event loop thread
+        # This prevents blocking the asyncio event loop and avoids 502 Bad Gateway timeouts on Render
+        analysis_result = await asyncio.to_thread(
+            process_video_diarization,
             temp_video_path,
             video_id,
             host_name=host_name,
@@ -395,7 +402,11 @@ async def extract_audio_from_video(
             "message": "Audio extracted and speaker diarization completed successfully.",
             "data": analysis_result
         }
+    except HTTPException:
+        raise
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Audio extraction failed: {str(e)}")
 
 @app.api_route("/api/audio/stream/{video_id}/{filename}", methods=["GET", "HEAD"])
@@ -529,7 +540,8 @@ async def diarize_and_transcribe_video(
                 buffer.write(chunk)
 
         print(f"[API] Processing {file.filename} with Apple Silicon M2 GPU pipeline (dynamic speakers: {num_speakers})...")
-        result = process_meeting_pipeline(
+        result = await asyncio.to_thread(
+            process_meeting_pipeline,
             video_path=temp_video_path,
             video_id=video_id,
             speaker_0_name=speaker_0 or "Host",
@@ -749,7 +761,7 @@ async def analyze_meeting_video_endpoint(
     
     # 2. Extract 16kHz mono audio via FFmpeg
     try:
-        extract_wav_with_ffmpeg(video_save_path, wav_save_path)
+        await asyncio.to_thread(extract_wav_with_ffmpeg, video_save_path, wav_save_path)
     except Exception as extract_err:
         print(f"[analyze-video] Audio extraction error: {extract_err}.")
         raise HTTPException(

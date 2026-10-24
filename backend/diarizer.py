@@ -6,10 +6,23 @@ import shutil
 import wave
 import struct
 import subprocess
+import tempfile
 from typing import List, Dict, Any, Optional
 
 import torch
 import numpy as np
+
+def get_ffmpeg_binary() -> str:
+    env_ffmpeg = os.environ.get("FFMPEG_PATH") or os.environ.get("FFMPEG_BIN")
+    if env_ffmpeg and os.path.exists(env_ffmpeg):
+        return env_ffmpeg
+    which_ffmpeg = shutil.which("ffmpeg")
+    if which_ffmpeg and os.path.exists(which_ffmpeg):
+        return which_ffmpeg
+    for path in ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"]:
+        if os.path.exists(path) and os.access(path, os.X_OK):
+            return path
+    return which_ffmpeg or "ffmpeg"
 
 # ---------------------------------------------------------------------------
 # Apple Silicon (MacBook Air M2 GPU via MPS) Configuration
@@ -32,10 +45,10 @@ def get_torch_device() -> torch.device:
 
 DEVICE = get_torch_device()
 
-# Storage directories
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-SCRIPTS_DIR = os.path.join(BASE_DIR, "storage", "scripts")
-TEMP_AUDIO_DIR = os.path.join(BASE_DIR, "storage", "audio_temp")
+# Storage directories (Guaranteed /tmp storage for Render Linux container)
+SYSTEM_TEMP = os.path.abspath(tempfile.gettempdir())
+SCRIPTS_DIR = os.path.join(SYSTEM_TEMP, "guardianeye_scripts")
+TEMP_AUDIO_DIR = os.path.join(SYSTEM_TEMP, "guardianeye_audio_temp")
 os.makedirs(SCRIPTS_DIR, exist_ok=True)
 os.makedirs(TEMP_AUDIO_DIR, exist_ok=True)
 
@@ -47,8 +60,9 @@ def extract_audio_16k_mono(input_path: str, output_wav_path: str) -> bool:
     Extracts raw audio using ffmpeg configured strictly for 16kHz mono PCM wave format.
     """
     os.makedirs(os.path.dirname(output_wav_path), exist_ok=True)
+    ffmpeg_bin = get_ffmpeg_binary()
     cmd = [
-        "ffmpeg",
+        ffmpeg_bin,
         "-y",
         "-i", input_path,
         "-vn",

@@ -8,7 +8,33 @@ import time
 import tempfile
 from typing import Dict, List, Any, Optional, Tuple
 
-FFMPEG_BIN = shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
+def get_ffmpeg_binary() -> str:
+    """
+    Resolves the system's ffmpeg executable using absolute paths or PATH lookup.
+    Prioritizes standard Linux locations used by Render's Debian/Ubuntu containers.
+    """
+    env_ffmpeg = os.environ.get("FFMPEG_PATH") or os.environ.get("FFMPEG_BIN")
+    if env_ffmpeg and os.path.exists(env_ffmpeg):
+        return env_ffmpeg
+
+    which_ffmpeg = shutil.which("ffmpeg")
+    if which_ffmpeg and os.path.exists(which_ffmpeg):
+        return which_ffmpeg
+
+    candidates = [
+        "/usr/bin/ffmpeg",             # Default Debian/Ubuntu apt install location
+        "/usr/local/bin/ffmpeg",       # Common compiled/custom location
+        "/bin/ffmpeg",                 # Core binary path
+        "/opt/homebrew/bin/ffmpeg",    # macOS Apple Silicon
+        "/usr/local/opt/ffmpeg/bin/ffmpeg"
+    ]
+    for path in candidates:
+        if os.path.exists(path) and os.access(path, os.X_OK):
+            return path
+
+    return which_ffmpeg or "ffmpeg"
+
+FFMPEG_BIN = get_ffmpeg_binary()
 TEMP_DIR = os.path.abspath(tempfile.gettempdir())
 
 def extract_wav_with_ffmpeg(video_path: str, output_wav_path: str) -> bool:
@@ -49,12 +75,9 @@ def extract_wav_with_ffmpeg(video_path: str, output_wav_path: str) -> bool:
     if not os.path.exists(abs_video) or os.path.getsize(abs_video) == 0:
         raise RuntimeError(f"Video file at {abs_video} is missing or empty (0 bytes). Cannot extract audio.")
 
-    ffmpeg_bin = shutil.which("ffmpeg") or FFMPEG_BIN
-    if not os.path.exists(ffmpeg_bin) and shutil.which("ffmpeg") is None:
-        raise RuntimeError(f"FFmpeg binary not found at {ffmpeg_bin} or in system PATH.")
-    
+    ffmpeg_bin = get_ffmpeg_binary()
     in_size = os.path.getsize(abs_video)
-    print(f"[FFmpeg] Input video track: {abs_video} ({in_size} bytes, tempDir: {abs_temp})")
+    print(f"[FFmpeg] Input video track: {abs_video} ({in_size} bytes, tempDir: {abs_temp}, bin: {ffmpeg_bin})")
     
     cmd = [
         ffmpeg_bin,
@@ -67,7 +90,15 @@ def extract_wav_with_ffmpeg(video_path: str, output_wav_path: str) -> bool:
         abs_output
     ]
     
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+    except FileNotFoundError:
+        print(f"[FFmpeg] Binary {ffmpeg_bin} not found, falling back to 'ffmpeg' in PATH")
+        cmd[0] = "ffmpeg"
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("FFmpeg extraction timed out after 120 seconds.")
+
     if res.returncode != 0:
         err = res.stderr.decode("utf-8", errors="ignore")
         print(f"[FFmpeg] Hard Error during extraction: {err}")
