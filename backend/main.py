@@ -23,7 +23,16 @@ dotenv.load_dotenv(os.path.join(os.path.dirname(os.path.dirname(__file__)), "fro
 
 from audio_extractor import process_video_diarization, AUDIO_OUTPUT_DIR, UPLOAD_DIR
 from communication_coach_prompt import analyze_communication_coach
-from video_analysis_pipeline import extract_wav_with_ffmpeg, transcribe_audio, analyze_with_gemini, generate_groq_summary
+from video_analysis_pipeline import (
+    analyze_claim_with_gemini,
+    analyze_with_gemini,
+    run_live_meeting_pipeline,
+    safe_unlink,
+    stream_upload_to_tmp,
+    transcribe_audio,
+)
+
+PIPELINE_SEMAPHORE = asyncio.Semaphore(int(os.getenv("PIPELINE_CONCURRENCY", "2")))
 
 app = FastAPI(title="Video Meeting Analysis Backend", version="1.0.0")
 
@@ -130,10 +139,21 @@ def read_root():
 
 @app.get("/api/health")
 def health_check():
-    return {"status": "ok", "service": "Backend", "active_rooms": len(ACTIVE_ROOMS)}
+    groq_key, gemini_key = (os.getenv("GROQ_API_KEY") or "").strip(), (os.getenv("GEMINI_API_KEY") or "").strip()
+    return {
+        "status": "ok",
+        "service": "Backend",
+        "active_rooms": len(ACTIVE_ROOMS),
+        "groqConfigured": bool(groq_key),
+        "geminiConfigured": bool(gemini_key),
+        "pipelineConcurrency": int(os.getenv("PIPELINE_CONCURRENCY", "2")),
+    }
 
 @app.post("/api/auth/login")
-def login(req: LoginRequest):
+async def login(req: LoginRequest):
+    return await asyncio.to_thread(_login_sync, req)
+
+def _login_sync(req: LoginRequest):
     raw_email = req.email.strip().lower()
     email_clean = raw_email if "@" in raw_email else f"{raw_email}@gmail.com"
     pwd = req.password.strip()
@@ -195,7 +215,10 @@ def login(req: LoginRequest):
     }
 
 @app.post("/api/auth/register")
-def register(req: RegisterRequest):
+async def register(req: RegisterRequest):
+    return await asyncio.to_thread(_register_sync, req)
+
+def _register_sync(req: RegisterRequest):
     raw_email = req.email.strip().lower()
     email_clean = raw_email if "@" in raw_email else f"{raw_email}@gmail.com"
     pwd = req.password.strip()
@@ -249,7 +272,10 @@ def register(req: RegisterRequest):
     }
 
 @app.post("/api/meetings/create")
-def create_meeting(req: CreateMeetingRequest):
+async def create_meeting(req: CreateMeetingRequest):
+    return await asyncio.to_thread(_create_meeting_sync, req)
+
+def _create_meeting_sync(req: CreateMeetingRequest):
     import random
     chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     code = f"{''.join(random.choices(chars, k=3))}-{''.join(random.choices(chars, k=3))}"
@@ -278,7 +304,7 @@ def create_meeting(req: CreateMeetingRequest):
     return {"status": "success", "room": room_data}
 
 @app.get("/api/meetings/{room_code}")
-def get_meeting(room_code: str):
+async def get_meeting(room_code: str):
     code = room_code.strip().upper()
     room = ACTIVE_ROOMS.get(code)
     if not room:
@@ -294,53 +320,34 @@ def get_meeting(room_code: str):
 # Real-Time AI Fact-Checking Engine
 # ----------------------------------------------------
 @app.post("/api/ai/fact-check")
-def fact_check_claim(req: FactCheckRequest):
+async def fact_check_claim(req: FactCheckRequest):
     claim_text = req.claim.strip()
     if not claim_text:
         raise HTTPException(status_code=400, detail="Claim cannot be empty.")
-
-    lower = claim_text.lower()
-    has_numbers = any(char.isdigit() for char in claim_text)
-    has_absolutes = any(word in lower for word in ["always", "never", "100%", "proven", "guaranteed", "impossible"])
-    
-    if has_absolutes:
-        verdict = "Needs Context"
-        confidence = 68
-        analysis = "Absolute claim detected. In meeting dynamics, categorical statements require empirical validation."
-    elif has_numbers:
-        verdict = "Empirically Testable"
-        confidence = 85
-        analysis = "Quantitative assertion detected. Cross-reference metrics against quarterly deliverables."
-    else:
-        verdict = "Plausible"
-        confidence = 78
-        analysis = "Subjective / strategic statement consistent with team consensus."
-
-    return {
-        "claim": claim_text,
-        "verdict": verdict,
-        "confidence": confidence,
-        "analysis": analysis,
-        "timestamp": time.strftime("%H:%M:%S")
-    }
+    try:
+        return await analyze_claim_with_gemini(claim_text, req.meetingContext)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 # ----------------------------------------------------
 # Enterprise Communication Coaching Analysis Engine
 # ----------------------------------------------------
 @app.post("/api/ai/coach")
 @app.post("/api/ai/communication-coaching")
-def coach_speaker_communication(req: CommunicationCoachRequest):
-    """
-    Evaluates individual speaker communication behaviors against the 7-dimension rubric.
-    Returns calibrated scores, verbatim strengths, actionable improvement areas, and practice plan.
-    """
-    report = analyze_communication_coach(
+async def coach_speaker_communication(req: CommunicationCoachRequest):
+    """Evaluate speaker communication from the live transcript only (no few-shot template data)."""
+    if not req.transcript_segments:
+        raise HTTPException(
+            status_code=400,
+            detail="transcript_segments from a live meeting recording are required.",
+        )
+    return await asyncio.to_thread(
+        analyze_communication_coach,
         speaker_id=req.speaker_id,
         transcript_segments=req.transcript_segments,
         speech_statistics=req.speech_statistics,
-        meeting_context=req.meeting_context
+        meeting_context=req.meeting_context,
     )
-    return report
 
 # ----------------------------------------------------
 # Production Audio Extraction & Speaker Diarization Engine
@@ -352,62 +359,86 @@ async def extract_audio_from_video(
     participant_names: Optional[str] = Form(None)
 ):
     """
-    Accepts video or audio recording, extracts 16kHz master WAV,
-    runs Voice Activity Detection (VAD) and speaker acoustic clustering,
-    slices turns per speaker, and saves consolidated tracks for who spoke when.
+    Stream multipart video to /tmp, extract audio with FFmpeg, transcribe with
+    Groq Whisper-large-v3, then score the identical transcript with Gemini 1.5 Flash.
     """
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file provided.")
 
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
-    video_id = f"vid_{int(time.time())}_{os.urandom(3).hex()}"
-    extension = os.path.splitext(file.filename)[1] or ".mp4"
-    temp_video_filename = f"{video_id}{extension}"
-    temp_video_path = os.path.join(UPLOAD_DIR, temp_video_filename)
-
-    try:
-        # Stream file to disk in chunks to handle large recordings reliably
-        with open(temp_video_path, "wb") as buffer:
-            while chunk := await file.read(1024 * 1024): # 1MB chunks
-                buffer.write(chunk)
-            buffer.flush()
-            os.fsync(buffer.fileno())
-
-        if not os.path.exists(temp_video_path) or os.path.getsize(temp_video_path) == 0:
-            raise HTTPException(status_code=400, detail="Uploaded file is empty (0 bytes).")
-
-        # Parse participant names if provided (comma-separated or JSON list)
-        parsed_participants = []
-        if participant_names:
-            try:
-                if participant_names.strip().startswith("["):
-                    parsed_participants = json.loads(participant_names)
-                else:
-                    parsed_participants = [p.strip() for p in participant_names.split(",") if p.strip()]
-            except Exception:
-                parsed_participants = [p.strip() for p in participant_names.split(",") if p.strip()]
-
-        # Process audio extraction & speaker diarization off the event loop thread
-        # This prevents blocking the asyncio event loop and avoids 502 Bad Gateway timeouts on Render
-        analysis_result = await asyncio.to_thread(
-            process_video_diarization,
-            temp_video_path,
-            video_id,
-            host_name=host_name,
-            participant_names=parsed_participants
+    groq_key = (os.getenv("GROQ_API_KEY") or "").strip()
+    gemini_key = (os.getenv("GEMINI_API_KEY") or "").strip()
+    if not groq_key or not gemini_key:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="GROQ_API_KEY and GEMINI_API_KEY must be set in the environment.",
         )
-        analysis_result["originalFilename"] = file.filename
-        return {
-            "status": "success",
-            "message": "Audio extracted and speaker diarization completed successfully.",
-            "data": analysis_result
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Audio extraction failed: {str(e)}")
+
+    parsed_participants = []
+    if participant_names:
+        try:
+            if participant_names.strip().startswith("["):
+                parsed_participants = json.loads(participant_names)
+            else:
+                parsed_participants = [p.strip() for p in participant_names.split(",") if p.strip()]
+        except Exception:
+            parsed_participants = [p.strip() for p in participant_names.split(",") if p.strip()]
+
+    temp_video_path = None
+    async with PIPELINE_SEMAPHORE:
+        try:
+            temp_video_path = await stream_upload_to_tmp(file)
+            video_id = os.path.splitext(os.path.basename(temp_video_path))[0]
+            analysis_result = await asyncio.to_thread(
+                process_video_diarization,
+                temp_video_path,
+                video_id,
+                host_name=host_name,
+                participant_names=parsed_participants,
+            )
+            dialogue_script = analysis_result.get("dialogueScript") or ""
+            timeline = analysis_result.get("timeline") or []
+            gemini_turns = [
+                {
+                    "speaker": t.get("speakerName"),
+                    "isHost": t.get("role") == "Host",
+                    "text": t.get("text", ""),
+                    "start": t.get("startTimeSec"),
+                    "end": t.get("endTimeSec"),
+                }
+                for t in timeline
+            ]
+            analytics = await analyze_with_gemini(
+                raw_transcript=dialogue_script,
+                dialogue_turns=gemini_turns,
+                host_name=(host_name or "Host").strip() or "Host",
+                guest_name=(parsed_participants[0] if parsed_participants else "Participant"),
+                gemini_api_key=gemini_key,
+                segments=gemini_turns,
+            )
+            analysis_result["originalFilename"] = file.filename
+            analysis_result["speakerRatings"] = analytics.get("speakerRatings", {})
+            analysis_result["factCheckAudit"] = analytics.get("factCheckAudit", [])
+            analysis_result["compliance"] = analytics.get("compliance", {})
+            analysis_result["scorecard"] = analytics.get("scorecard", {})
+            analysis_result["gemini_model"] = analytics.get("gemini_model")
+            if analytics.get("claims"):
+                insights = analysis_result.get("meetingInsights") or {}
+                insights["claims"] = analytics.get("claims")
+                insights["actionItems"] = analytics.get("actionItems") or []
+                analysis_result["meetingInsights"] = insights
+            return {
+                "status": "success",
+                "message": "Live Groq transcription and Gemini scorecard completed.",
+                "data": analysis_result,
+            }
+        except HTTPException:
+            raise
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"Audio extraction failed: {str(e)}")
+        finally:
+            safe_unlink(temp_video_path)
 
 @app.api_route("/api/audio/stream/{video_id}/{filename}", methods=["GET", "HEAD"])
 async def stream_audio_file(video_id: str, filename: str):
@@ -528,17 +559,10 @@ async def diarize_and_transcribe_video(
     if not file.filename:
         raise HTTPException(status_code=400, detail="No video file provided.")
 
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
-    video_id = f"m2_diar_{int(time.time())}_{os.urandom(3).hex()}"
-    extension = os.path.splitext(file.filename)[1] or ".webm"
-    temp_video_path = os.path.join(UPLOAD_DIR, f"{video_id}{extension}")
-
+    temp_video_path = None
     try:
-        # Stream file to disk in 1MB chunks
-        with open(temp_video_path, "wb") as buffer:
-            while chunk := await file.read(1024 * 1024):
-                buffer.write(chunk)
-
+        temp_video_path = await stream_upload_to_tmp(file)
+        video_id = os.path.splitext(os.path.basename(temp_video_path))[0]
         print(f"[API] Processing {file.filename} with Apple Silicon M2 GPU pipeline (dynamic speakers: {num_speakers})...")
         result = await asyncio.to_thread(
             process_meeting_pipeline,
@@ -595,6 +619,8 @@ async def get_transcription_details(video_id: str):
 
     if not os.path.exists(json_path):
         raise HTTPException(status_code=404, detail="Transcription data not found.")
+    with open(json_path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
 
 class FirebaseTranscribeRequest(BaseModel):
     meetingId: str
@@ -671,7 +697,7 @@ async def firebase_transcribe_meeting(req: FirebaseTranscribeRequest):
             spk = match.group(1).strip()
             text = match.group(2).strip()
         else:
-            spk = host if idx % 2 == 0 else guest
+            spk = host
             text = line
         unique_speakers.add(spk)
         is_host = (spk.lower() == host.lower())
@@ -709,26 +735,26 @@ async def analyze_meeting_video_endpoint(
     meetingId: Optional[str] = Form(None),
     hostName: Optional[str] = Form(None),
     participantNames: Optional[str] = Form(None),
-    groqApiKey: Optional[str] = Form(None),
-    geminiApiKey: Optional[str] = Form(None)
 ):
     """
-    Real-World Video Footage Analysis Pipeline (100% Media Driven):
-    1. Saves uploaded video footage (mp4/webm).
-    2. Extracts 16kHz mono audio WAV using FFmpeg with strict lookahead.
-    3. Streams to Groq OpenAI Whisper Large-V3 for verbatim transcription.
-    4. If Groq or Gemini returns an empty payload, throws genuine HTTP 500 error.
-    5. Returns unified analytical dataset driven entirely by uploaded media.
+    Live video pipeline: stream multipart to /tmp, FFmpeg extract, Groq Whisper-large-v3
+    dialogueScript, Gemini 1.5 Flash scorecard on that same transcript. HTTP 200 with live data.
     """
+    groq_key = (os.getenv("GROQ_API_KEY") or "").strip()
+    gemini_key = (os.getenv("GEMINI_API_KEY") or "").strip()
+    if not groq_key or not gemini_key:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="GROQ_API_KEY and GEMINI_API_KEY must be set in the environment.",
+        )
+
     raw_mid = (meetingId or "").strip()
-    if not raw_mid or raw_mid == "meeting_default" or raw_mid == "default":
+    if not raw_mid or raw_mid in ("meeting_default", "default"):
         clean_meeting_id = f"meeting_{int(time.time())}_{uuid.uuid4().hex[:8]}"
     else:
         clean_meeting_id = raw_mid
-    clean_host = (hostName or "").strip()
-    if not clean_host or clean_host.lower() == "host":
-        clean_host = "ABHIGOWDA819761"
-    
+    clean_host = (hostName or "").strip() or "Host"
+
     clean_guest = "Participant"
     if participantNames:
         p_raw = participantNames.strip()
@@ -736,161 +762,71 @@ async def analyze_meeting_video_endpoint(
             try:
                 parsed_list = json.loads(p_raw)
                 if parsed_list and isinstance(parsed_list, list):
-                    clean_guest = str(parsed_list[0]).strip()
+                    clean_guest = str(parsed_list[0]).strip() or clean_guest
             except Exception:
-                clean_guest = p_raw.strip("[]\"' ")
+                clean_guest = p_raw.strip("[]\"' ") or clean_guest
         else:
-            clean_guest = p_raw.split(",")[0].strip()
-    if not clean_guest or clean_guest.lower() == "participant":
-        clean_guest = "Participant"
+            clean_guest = p_raw.split(",")[0].strip() or clean_guest
 
-    # Secure API Keys from parameters or environment
-    clean_groq_key = (groqApiKey or os.getenv("GROQ_API_KEY", "")).strip()
-    clean_gemini_key = (geminiApiKey or os.getenv("GEMINI_API_KEY", "")).strip()
-    
-    # Generate safe paths
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
-    os.makedirs(AUDIO_OUTPUT_DIR, exist_ok=True)
-    
-    file_ext = os.path.splitext(file.filename or "")[1] or ".webm"
-    video_save_path = os.path.abspath(os.path.join(UPLOAD_DIR, f"{clean_meeting_id}_raw{file_ext}"))
-    wav_save_path = os.path.abspath(os.path.join(AUDIO_OUTPUT_DIR, f"{clean_meeting_id}_audio.wav"))
-    
-    # 1. Save video file to disk with buffer check
-    content = await file.read()
-    if not content or len(content) == 0:
-        print(f"[analyze-video] Uploaded buffer is 0 bytes for meeting {clean_meeting_id}.")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Uploaded video footage is empty (0 bytes). Cannot extract audio track."
-        )
-
-    with open(video_save_path, "wb") as buffer:
-        buffer.write(content)
-        
-    print(f"[analyze-video] Received video footage: {video_save_path} ({len(content)} bytes)")
-    
-    # 2. Extract 16kHz mono audio via FFmpeg
-    try:
-        await asyncio.to_thread(extract_wav_with_ffmpeg, video_save_path, wav_save_path)
-    except Exception as extract_err:
-        print(f"[analyze-video] Audio extraction error: {extract_err}.")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Audio extraction failed: {str(extract_err)}"
-        )
-
-    if not os.path.exists(wav_save_path) or os.path.getsize(wav_save_path) < 44:
-        print(f"[analyze-video] Output audio file size is missing or < 44 bytes.")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Output audio file is missing or 0 bytes (< 44-byte WAV header). Cannot pass to Groq Whisper Large-V3."
-        )
-
-    print(f"[analyze-video] Extracted audio WAV: {wav_save_path} ({os.path.getsize(wav_save_path)} bytes)")
-    
-    # 3. Transcribe with Groq Whisper Large-V3 (or faster-whisper)
-    try:
-        transcription = await transcribe_audio(
-            wav_path=wav_save_path,
-            host_name=clean_host,
-            guest_name=clean_guest,
-            groq_api_key=clean_groq_key
-        )
-    except Exception as t_err:
-        print(f"[analyze-video] Transcription notice: {t_err}.")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Groq Whisper transcription failed: {str(t_err)}"
-        )
-
-    raw_transcript = transcription.get("rawTranscript", "")
-    dialogue_turns = transcription.get("dialogueTurns", [])
-    
-    # Production Validation Audit: If Groq returns an empty payload, throw genuine HTTP 500 error.
-    # NOTE: is_single_turn is intentionally NOT a rejection gate — solo-speaker recordings are valid.
-    # Only block if the transcript array is completely empty or contains known dummy session strings.
-    is_empty_transcript = not raw_transcript or not dialogue_turns
-    is_dummy_session = (
-        raw_transcript.strip() == "Meeting audio session connected and verified."
-        or "Meeting audio session connected and verified." in raw_transcript
-    )
-
-    if is_empty_transcript or is_dummy_session:
-        print(f"[analyze-video] Audit check failed: isEmpty={is_empty_transcript}, turns={len(dialogue_turns)}, isDummy={is_dummy_session}.")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Groq Whisper returned an empty payload: acoustic voice data could not be parsed from this video track."
-        )
-
-    print(f"[analyze-video] Transcription complete ({transcription.get('model')}): {len(dialogue_turns)} dialogue turns")
-    
-    # 4. Generate concise meeting summary strictly based on captured words using Groq
-    meeting_summary = await generate_groq_summary(raw_transcript, clean_groq_key)
-
-    # 5. Analyze with Gemini 1.5 Flash (Ratings & Fact-Check)
-    raw_segments = transcription.get("segments") or transcription.get("groqSegments") or dialogue_turns
-    analytics = await analyze_with_gemini(
-        raw_transcript=raw_transcript,
-        dialogue_turns=dialogue_turns,
-        host_name=clean_host,
-        guest_name=clean_guest,
-        gemini_api_key=clean_gemini_key,
-        segments=raw_segments
-    )
-    
-    fact_check_audit = analytics.get("factCheckAudit", [])
-    speaker_ratings = analytics.get("speakerRatings", {})
-
-    if not analytics or not speaker_ratings or len(speaker_ratings) == 0:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Gemini returned an empty payload: analytical metrics could not be generated."
-        )
-
-    print(f"[analyze-video] Analysis complete ({analytics.get('gemini_model')})")
-
-    # Adapt dynamic speakers naturally to real voice counts extracted by Groq
-    # Map 'Speaker 0' directly to the dynamic request metadata 'hostName'
-    unique_speakers = []
-    for t in dialogue_turns:
-        spk = (t.get("speaker") or "").strip()
-        if spk and spk not in unique_speakers:
-            unique_speakers.append(spk)
-
-    speakers_dict = {"speaker_0": clean_host}
-    for idx, spk in enumerate(unique_speakers):
-        if idx == 0:
-            speakers_dict["speaker_0"] = clean_host
-        else:
-            speakers_dict[f"speaker_{idx}"] = spk
-
-    guest_spoke = len(unique_speakers) > 1 and any(
-        spk != clean_host and speaker_ratings.get(spk, {}).get("word_count", 0) >= 10
-        for spk in unique_speakers
-    )
-
-    # If only the Host spoke, factCheckAudit must be strictly []
-    if not guest_spoke:
-        fact_check_audit = []
-
-    return {
-        "success": True,
-        "meetingId": clean_meeting_id,
-        "rawTranscript": raw_transcript,
-        "transcriptText": raw_transcript,
-        "dialogueTurns": dialogue_turns,
-        "speakerRatings": speaker_ratings,
-        "factCheckAudit": fact_check_audit,
-        "summary": meeting_summary or analytics.get("summary", ""),
-        "meetingSummary": meeting_summary or analytics.get("summary", ""),
-        "speakers": speakers_dict,
-        "model": transcription.get("model", "whisper-large-v3"),
-        "gemini_model": analytics.get("gemini_model", "gemini-1.5-flash"),
-        "transcriptionStatus": "completed",
-        "ratingsStatus": "completed",
-        "factCheckStatus": "completed"
-    }
+    temp_video_path = None
+    wav_path = None
+    async with PIPELINE_SEMAPHORE:
+        try:
+            temp_video_path = await stream_upload_to_tmp(file)
+            result = await run_live_meeting_pipeline(
+                video_path=temp_video_path,
+                host_name=clean_host,
+                guest_name=clean_guest,
+                groq_api_key=groq_key,
+                gemini_api_key=gemini_key,
+            )
+            wav_path = result.get("wavPath")
+            transcription = result["transcription"]
+            analytics = result["analytics"]
+            raw_transcript = result["dialogueScript"]
+            dialogue_turns = result["dialogueTurns"]
+            speaker_ratings = analytics.get("speakerRatings") or {}
+            unique_speakers = []
+            for turn in dialogue_turns:
+                spk = (turn.get("speaker") or "").strip()
+                if spk and spk not in unique_speakers:
+                    unique_speakers.append(spk)
+            speakers_dict = {}
+            for idx, spk in enumerate(unique_speakers or [clean_host]):
+                speakers_dict[f"speaker_{idx}"] = spk
+            guest_spoke = len(unique_speakers) > 1
+            fact_check_audit = analytics.get("factCheckAudit", []) if guest_spoke else []
+            return {
+                "success": True,
+                "meetingId": clean_meeting_id,
+                "rawTranscript": raw_transcript,
+                "transcriptText": raw_transcript,
+                "dialogueScript": raw_transcript,
+                "dialogueTurns": dialogue_turns,
+                "speakerRatings": speaker_ratings,
+                "factCheckAudit": fact_check_audit,
+                "compliance": analytics.get("compliance", {}),
+                "scorecard": analytics.get("scorecard", speaker_ratings),
+                "summary": result.get("summary") or analytics.get("summary", ""),
+                "meetingSummary": result.get("summary") or analytics.get("summary", ""),
+                "speakers": speakers_dict,
+                "model": transcription.get("model", "whisper-large-v3"),
+                "gemini_model": analytics.get("gemini_model", "gemini-1.5-flash"),
+                "transcriptionStatus": "completed",
+                "ratingsStatus": "completed",
+                "factCheckStatus": "completed",
+            }
+        except HTTPException:
+            raise
+        except Exception as exc:
+            print(f"[analyze-video] {exc}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=str(exc),
+            ) from exc
+        finally:
+            safe_unlink(temp_video_path)
+            safe_unlink(wav_path)
 
 @app.post("/api/firebase/generate-meeting-transcription")
 async def generate_meeting_transcription_api(req: FirebaseTranscribeRequest):
@@ -940,11 +876,11 @@ async def generate_meeting_transcription_api(req: FirebaseTranscribeRequest):
                 detail="Acoustic voice data could not be parsed: audio file not found."
             )
 
-    # Check for empty, single-turn, or dummy session
-    if not raw_transcript or len(dialogue_turns) <= 1 or "Meeting audio session connected and verified." in raw_transcript:
+    dummy_marker = "Meeting audio session connected and verified."
+    if not raw_transcript or not dialogue_turns or dummy_marker in raw_transcript:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Groq Whisper returned an empty payload: acoustic voice data could not be parsed."
+            detail="No live Groq transcript is available for this meeting.",
         )
 
     # Run real Gemini analysis
@@ -994,13 +930,18 @@ async def analyze_meeting_ratings_api(req: AnalyzeRatingsRequest):
     """
     host = req.hostName or "Host"
     guest = (req.participantNames and req.participantNames[0]) or "Participant"
-    raw_transcript = req.rawTranscript or ""
-    
+    raw_transcript = (req.rawTranscript or "").strip()
+    if not raw_transcript:
+        raise HTTPException(
+            status_code=400,
+            detail="rawTranscript from a live meeting recording is required.",
+        )
+
     dialogue_turns = []
     lines = [l.strip() for l in raw_transcript.split("\n") if l.strip()]
     for idx, line in enumerate(lines):
         match = re.match(r"^([^:]+):\s*(.+)$", line)
-        spk = match.group(1).strip() if match else (host if idx % 2 == 0 else guest)
+        spk = match.group(1).strip() if match else host
         text = match.group(2).strip() if match else line
         dialogue_turns.append({
             "id": f"turn_{idx}",
@@ -1029,14 +970,19 @@ async def audit_meeting_fact_check_api(req: AnalyzeRatingsRequest):
     """
     host = req.hostName or "Host"
     guest = (req.participantNames and req.participantNames[0]) or "Participant"
-    raw_transcript = req.rawTranscript or ""
+    raw_transcript = (req.rawTranscript or "").strip()
+    if not raw_transcript:
+        raise HTTPException(
+            status_code=400,
+            detail="rawTranscript from a live meeting recording is required.",
+        )
 
     dialogue_turns = []
     if raw_transcript:
         lines = [l.strip() for l in raw_transcript.split("\n") if l.strip()]
         for idx, line in enumerate(lines):
             match = re.match(r"^([^:]+):\s*(.+)$", line)
-            spk = match.group(1).strip() if match else (host if idx % 2 == 0 else guest)
+            spk = match.group(1).strip() if match else host
             text = match.group(2).strip() if match else line
             dialogue_turns.append({
                 "id": f"turn_{idx}",

@@ -49,7 +49,7 @@ def analyze_speaker_acoustics(
     hop_len = int(sr * 0.015)  # 15ms
     n_frames = (len(combined_clip) - frame_len) // hop_len
 
-    wpm = 135
+    wpm = 0
     hesitation_count = 0
     if n_frames > 10:
         energies = np.zeros(n_frames)
@@ -95,7 +95,7 @@ def analyze_speaker_acoustics(
             pitch_values.append(float(sr / (min_lag + np.argmax(lag_sub))))
 
     if not pitch_values:
-        pitch_values = [160.0]
+        pitch_values = [0.0]
 
     mean_pitch = float(np.mean(pitch_values))
     std_pitch = float(np.std(pitch_values))
@@ -213,24 +213,25 @@ def analyze_speaker_acoustics(
     }
 
 def get_fallback_analytics(is_host: bool = False) -> Dict[str, Any]:
-    """Fallback analytics if audio slice is negligible."""
-    base_comm = 8.2 if is_host else 7.4
+    """Zeroed metrics when a speaker has no usable live audio — never invented scores."""
     return {
-        "communication": base_comm,
-        "fluency": 7.8,
-        "awkwardness": 1.2,
-        "facial": 8.5,
-        "leadership": 7.5 if is_host else 6.2,
-        "dominance": 6.8 if is_host else 5.2,
-        "sentiment": "Positive",
-        "emotion": "Confident" if is_host else "Neutral",
-        "total": 8.1 if is_host else 7.3,
-        "wpm": 138,
-        "fillerWords": 2,
-        "hesitationCount": 1,
-        "spectralCentroid": 450.0,
-        "pitchVariation": 0.20,
-        "meanPitchHz": 180.0
+        "communication": 0.0,
+        "fluency": 0.0,
+        "awkwardness": 0.0,
+        "facial": 0.0,
+        "leadership": 0.0,
+        "dominance": 0.0,
+        "sentiment": "Unknown",
+        "emotion": "Unknown",
+        "total": 0.0,
+        "wpm": 0,
+        "fillerWords": 0,
+        "hesitationCount": 0,
+        "spectralCentroid": 0.0,
+        "pitchVariation": 0.0,
+        "meanPitchHz": 0.0,
+        "insufficientAudio": True,
+        "isHost": bool(is_host),
     }
 
 def generate_meeting_insights(
@@ -241,68 +242,25 @@ def generate_meeting_insights(
     Extracts high-level meeting intelligence, automated claim verification,
     and structured action items based on speaker contributions.
     """
-    spk_names = [s.get("name", "Participant") for s in speakers_list]
-    host_name = spk_names[0] if spk_names else "Meeting Host"
-
-    # Executive claims extracted from discussion for automated fact-checking
-    claims = [
-        {
-            "claim": f"Our Q3 deliverable timeline was successfully completed ahead of schedule under {host_name}.",
-            "speaker": host_name,
-            "verdict": "Verified",
-            "confidence": 94,
-            "analysis": "Cross-referenced with sprint completion milestones and engineering repository logs.",
-            "timestamp": "00:24"
-        },
-        {
-            "claim": "All system services maintain 99.98% uptime SLA with active WebRTC media relay nodes.",
-            "speaker": spk_names[1] if len(spk_names) > 1 else host_name,
-            "verdict": "Verified",
-            "confidence": 91,
-            "analysis": "Validated across telemetry metrics; operational latency verified below 45ms.",
-            "timestamp": "01:05"
-        },
-        {
-            "claim": "Customer adoption increased by over 40% following the streamlined role entrance workflow.",
-            "speaker": spk_names[2] if len(spk_names) > 2 else host_name,
-            "verdict": "Empirically Testable",
-            "confidence": 86,
-            "analysis": "Consistent with weekly user engagement metrics logged in quarterly database analytics.",
-            "timestamp": "01:48"
-        }
-    ]
-
-    action_items = [
-        {
-            "task": "Finalize multi-speaker voice profile verification ahead of tomorrow's launch.",
-            "assignee": host_name,
-            "priority": "High",
-            "status": "In Progress"
-        },
-        {
-            "task": "Review WebRTC participant capacity limits and audio telemetry stream buffer.",
-            "assignee": spk_names[1] if len(spk_names) > 1 else "Engineering Team",
-            "priority": "High",
-            "status": "Completed"
-        },
-        {
-            "task": "Distribute automated meeting summary and behavioral scorecard to leadership.",
-            "assignee": spk_names[2] if len(spk_names) > 2 else host_name,
-            "priority": "Medium",
-            "status": "Pending"
-        }
-    ]
-
-    # Overall Meeting Metrics
-    avg_fluency = round(float(np.mean([s.get("analytics", {}).get("fluency", 7.5) for s in speakers_list])), 1)
-    avg_comm = round(float(np.mean([s.get("analytics", {}).get("communication", 7.5) for s in speakers_list])), 1)
-    overall_sentiment = "Positive" if avg_comm >= 7.5 else "Neutral"
+    live_analytics = [s.get("analytics") or {} for s in speakers_list]
+    fluency_vals = [float(a.get("fluency") or 0) for a in live_analytics]
+    comm_vals = [float(a.get("communication") or 0) for a in live_analytics]
+    wpm_vals = [float(a.get("wpm") or 0) for a in live_analytics]
+    avg_fluency = round(float(np.mean(fluency_vals)), 1) if fluency_vals else 0.0
+    avg_comm = round(float(np.mean(comm_vals)), 1) if comm_vals else 0.0
+    avg_wpm = int(np.mean(wpm_vals)) if wpm_vals else 0
+    if avg_comm >= 7.5:
+        overall_sentiment = "Positive"
+    elif avg_comm > 0:
+        overall_sentiment = "Neutral"
+    else:
+        overall_sentiment = "Unknown"
 
     return {
         "overallSentiment": overall_sentiment,
-        "teamCollaborationIndex": round(float(np.clip(avg_comm * 10.0 + 5.0, 65.0, 98.0)), 1),
+        "teamCollaborationIndex": round(float(np.clip(avg_comm * 10.0, 0.0, 100.0)), 1),
         "averageFluency": avg_fluency,
-        "averageWpm": int(np.mean([s.get("analytics", {}).get("wpm", 138) for s in speakers_list])),
-        "claims": claims,
-        "actionItems": action_items
+        "averageWpm": avg_wpm,
+        "claims": [],
+        "actionItems": [],
     }

@@ -109,15 +109,7 @@ def extract_master_wav_from_video(video_path: str, output_wav_path: str) -> bool
 
     if result.returncode != 0:
         error_msg = result.stderr.decode('utf-8', errors='ignore')
-        if "does not contain any stream" in error_msg or "matches no streams" in error_msg or "Invalid data found" in error_msg:
-            print(f"[audio_extractor] Notice: No audio stream found in video ({error_msg[:100]}). Generating silent 3s WAV.")
-            with wave.open(abs_output, "wb") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(16000)
-                wf.writeframes(b"\x00" * 32000 * 3)
-        else:
-            raise RuntimeError(f"FFmpeg audio extraction failed (code {result.returncode}): {error_msg}")
+        raise RuntimeError(f"FFmpeg audio extraction failed (code {result.returncode}): {error_msg}")
 
     if not os.path.exists(abs_output) or os.path.getsize(abs_output) == 0:
         raise RuntimeError(f"Extracted audio file is missing or 0 bytes at {abs_output}")
@@ -353,41 +345,39 @@ def create_speaker_consolidated_wav(src_wav: str, dest_wav: str, intervals: List
         w.writeframes(bytes(combined_frames))
 
 def transcribe_master_with_groq(wav_path: str) -> List[Dict[str, Any]]:
-    """
-    Rapidly transcribes the master WAV file using Groq Whisper Large-V3 in a single API call.
-    Zero local CPU/RAM overhead; prevents Render 512MB free tier OOM crashes.
-    """
-    groq_key = os.environ.get("GROQ_API_KEY", "").strip()
-    if not groq_key or not os.path.exists(wav_path) or os.path.getsize(wav_path) < 1000:
-        return []
+    """Transcribe master WAV with Groq Whisper-large-v3. Raises if live speech cannot be captured."""
+    groq_key = (os.environ.get("GROQ_API_KEY") or "").strip()
+    if not groq_key:
+        raise RuntimeError("GROQ_API_KEY is not set in the environment.")
+    if not os.path.exists(wav_path) or os.path.getsize(wav_path) < 44:
+        raise RuntimeError(f"WAV missing or empty: {wav_path}")
 
-    try:
-        import httpx
-        with open(wav_path, "rb") as f:
-            files = {"file": (os.path.basename(wav_path), f, "audio/wav")}
-            data = {
-                "model": "whisper-large-v3",
-                "response_format": "verbose_json",
-                "temperature": "0.0"
-            }
-            headers = {"Authorization": f"Bearer {groq_key}"}
-            with httpx.Client(timeout=45.0) as client:
-                resp = client.post(
-                    "https://api.groq.com/openai/v1/audio/transcriptions",
-                    files=files,
-                    data=data,
-                    headers=headers
-                )
-                if resp.status_code == 200:
-                    payload = resp.json()
-                    segments = payload.get("segments", [])
-                    print(f"[audio_extractor] Groq transcribed master WAV into {len(segments)} segments.")
-                    return segments
-                else:
-                    print(f"[audio_extractor] Groq API returned status {resp.status_code}: {resp.text[:120]}")
-    except Exception as e:
-        print(f"[audio_extractor] Groq transcription notice: {e}")
-    return []
+    import httpx
+    with open(wav_path, "rb") as f:
+        files = {"file": (os.path.basename(wav_path), f, "audio/wav")}
+        data = {
+            "model": "whisper-large-v3",
+            "response_format": "verbose_json",
+            "temperature": "0.0",
+        }
+        headers = {"Authorization": f"Bearer {groq_key}"}
+        with httpx.Client(timeout=180.0) as client:
+            resp = client.post(
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                files=files,
+                data=data,
+                headers=headers,
+            )
+    if resp.status_code != 200:
+        raise RuntimeError(f"Groq Whisper-large-v3 failed ({resp.status_code}): {resp.text[:800]}")
+    payload = resp.json()
+    segments = payload.get("segments") or []
+    if not segments and not (payload.get("text") or "").strip():
+        raise RuntimeError("Groq Whisper-large-v3 returned no speech from the uploaded meeting video.")
+    if not segments:
+        segments = [{"start": 0.0, "end": 0.0, "text": payload.get("text", "").strip()}]
+    print(f"[audio_extractor] Groq transcribed master WAV into {len(segments)} segments.")
+    return segments
 
 def process_video_diarization(
     video_path: str,
@@ -460,10 +450,19 @@ def process_video_diarization(
     total_speech_time = 0.0
 
     for idx, ((start, end), spk_id) in enumerate(zip(speech_segments, speaker_labels)):
+        overlapping = [
+            seg.get("text", "").strip()
+            for seg in groq_segments
+            if max(start, float(seg.get("start", 0.0))) < min(end, float(seg.get("end", end)))
+            and seg.get("text", "").strip()
+        ]
+        turn_text = " ".join(overlapping).strip()
+        if not turn_text:
+            continue
+
         duration = round(end - start, 2)
         total_speech_time += duration
 
-        # Slice individual turn audio
         turn_filename = f"speaker_{spk_id + 1}_turn_{idx + 1}.wav"
         turn_path = os.path.join(session_audio_dir, turn_filename)
         slice_wav_segment(master_wav_path, turn_path, start, end)
@@ -471,39 +470,6 @@ def process_video_diarization(
 
         spk_name = names_pool[spk_id] if spk_id < len(names_pool) else f"Participant {spk_id}"
         spk_role = "Host" if spk_id == 0 else "Participant"
-
-        # Transcribe turn: Priority 1 = Groq segments matching timestamp
-        turn_text = ""
-        if groq_segments:
-            overlapping = [
-                seg.get("text", "").strip()
-                for seg in groq_segments
-                if max(start, float(seg.get("start", 0.0))) < min(end, float(seg.get("end", end)))
-                and seg.get("text", "").strip()
-            ]
-            if overlapping:
-                turn_text = " ".join(overlapping)
-
-        # Priority 2: Local Whisper ONLY if explicitly enabled (to protect 512MB RAM from OOM)
-        if not turn_text and os.environ.get("USE_LOCAL_WHISPER", "").lower() == "true":
-            try:
-                from diarizer import get_whisper_model
-                model = get_whisper_model("tiny")
-                if model is not None and os.path.exists(turn_path) and os.path.getsize(turn_path) > 1000:
-                    res = model.transcribe(turn_path, fp16=False, language="en")
-                    turn_text = res.get("text", "").strip()
-            except Exception:
-                pass
-
-        if not turn_text:
-            context_dialogues = [
-                f"Reviewing our key milestones and aligning on the deliverables for this release.",
-                f"From my side, all functional modules and test suites are executing with high stability.",
-                f"Let me add some context regarding the timeline and performance metrics.",
-                f"Agreed. We should ensure the team is aligned on the deployment checklist.",
-                f"Thanks everyone, the action items are captured and ready for implementation."
-            ]
-            turn_text = context_dialogues[idx % len(context_dialogues)]
 
         turn_item = {
             "turnIndex": idx + 1,
@@ -535,6 +501,50 @@ def process_video_diarization(
         speakers_dict[spk_id]["totalSpokenSec"] += duration
         speakers_dict[spk_id]["turnCount"] += 1
         speakers_dict[spk_id]["turns"].append(turn_item)
+
+    if not chronological_timeline:
+        for idx, seg in enumerate(groq_segments):
+            text = (seg.get("text") or "").strip()
+            if not text:
+                continue
+            start = float(seg.get("start", 0.0))
+            end = float(seg.get("end", start + 0.5))
+            duration = round(max(0.0, end - start), 2)
+            total_speech_time += duration
+            turn_filename = f"speaker_1_turn_{idx + 1}.wav"
+            turn_path = os.path.join(session_audio_dir, turn_filename)
+            slice_wav_segment(master_wav_path, turn_path, start, max(end, start + 0.2))
+            spk_name = names_pool[0]
+            turn_item = {
+                "turnIndex": idx + 1,
+                "speakerId": "SPEAKER_1",
+                "speakerName": spk_name,
+                "role": "Host",
+                "startTimeSec": start,
+                "endTimeSec": end,
+                "start": format_timestamp(start),
+                "end": format_timestamp(end),
+                "timestamp": f"{format_timestamp(start)} - {format_timestamp(end)}",
+                "duration": duration,
+                "durationFormatted": f"{round(duration, 1)}s",
+                "text": text,
+                "audioUrl": f"/api/audio/stream/{video_id}/{turn_filename}",
+            }
+            chronological_timeline.append(turn_item)
+            speakers_dict.setdefault(0, {
+                "id": "SPEAKER_1",
+                "name": spk_name,
+                "role": "Host",
+                "totalSpokenSec": 0.0,
+                "turnCount": 0,
+                "turns": [],
+            })
+            speakers_dict[0]["totalSpokenSec"] += duration
+            speakers_dict[0]["turnCount"] += 1
+            speakers_dict[0]["turns"].append(turn_item)
+
+    if not chronological_timeline:
+        raise RuntimeError("Groq Whisper-large-v3 returned no speech aligned to the uploaded meeting video.")
 
     # Generate combined audio track for each speaker
     speakers_list = []

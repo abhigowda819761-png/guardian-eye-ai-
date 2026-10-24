@@ -350,7 +350,7 @@ def build_communication_coach_prompt(
     transcript_segments: List[Dict[str, Any]],
     speech_statistics: Optional[Dict[str, Any]] = None,
     meeting_context: Optional[str] = None,
-    include_few_shot: bool = True
+    include_few_shot: bool = False
 ) -> str:
     """
     Constructs the complete, calibrated prompt for the LLM inference engine.
@@ -481,7 +481,8 @@ def analyze_communication_coach(
                 speaker_id=speaker_id,
                 transcript_segments=target_segments,
                 speech_statistics=speech_statistics,
-                meeting_context=meeting_context
+                meeting_context=meeting_context,
+                include_few_shot=False,
             )
             url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={resolved_api_key}"
             payload = {

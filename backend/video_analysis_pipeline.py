@@ -1,336 +1,408 @@
+"""
+Live meeting analysis pipeline.
+
+Every transcription and scorecard value is produced from an uploaded meeting
+video: FFmpeg extracts audio in /tmp, Groq Whisper-large-v3 returns the true
+dialogueScript, and Gemini 1.5 Flash scores that same transcript. No mock,
+template, or deterministic stand-in data is returned.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
 import os
-import sys
+import re
 import shutil
 import subprocess
-import json
-import re
-import time
 import tempfile
-from typing import Dict, List, Any, Optional, Tuple
+import time
+import uuid
+from typing import Any, Dict, List, Optional, Tuple
+
+import httpx
+
+GROQ_TRANSCRIBE_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+GROQ_WHISPER_MODEL = "whisper-large-v3"
+GEMINI_MODEL = "gemini-1.5-flash"
+GEMINI_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    f"{GEMINI_MODEL}:generateContent"
+)
+GROQ_MAX_UPLOAD_BYTES = 24 * 1024 * 1024
+STREAM_CHUNK_BYTES = 1024 * 1024
+WAV_HEADER_BYTES = 44
+
+
+def load_api_keys() -> Tuple[str, str]:
+    groq_key = (os.getenv("GROQ_API_KEY") or "").strip()
+    gemini_key = (os.getenv("GEMINI_API_KEY") or "").strip()
+    return groq_key, gemini_key
+
+
+def require_api_keys() -> Tuple[str, str]:
+    groq_key, gemini_key = load_api_keys()
+    missing = []
+    if not groq_key:
+        missing.append("GROQ_API_KEY")
+    if not gemini_key:
+        missing.append("GEMINI_API_KEY")
+    if missing:
+        raise RuntimeError(
+            "Missing required environment variable(s): " + ", ".join(missing)
+        )
+    return groq_key, gemini_key
+
+
+def system_tmp_dir() -> str:
+    if os.path.isdir("/tmp") and os.access("/tmp", os.W_OK):
+        return "/tmp"
+    return os.path.abspath(tempfile.gettempdir())
+
+
+TEMP_DIR = system_tmp_dir()
+UPLOAD_TMP_DIR = os.path.join(TEMP_DIR, "guardianeye_uploads")
+AUDIO_TMP_DIR = os.path.join(TEMP_DIR, "guardianeye_audio")
+
 
 def get_ffmpeg_binary() -> str:
-    """
-    Resolves the system's ffmpeg executable using absolute paths or PATH lookup.
-    Prioritizes standard Linux locations used by Render's Debian/Ubuntu containers.
-    """
     env_ffmpeg = os.environ.get("FFMPEG_PATH") or os.environ.get("FFMPEG_BIN")
-    if env_ffmpeg and os.path.exists(env_ffmpeg):
+    if env_ffmpeg and os.path.exists(env_ffmpeg) and os.access(env_ffmpeg, os.X_OK):
         return env_ffmpeg
+
+    linux_bin = "/usr/bin/ffmpeg"
+    if os.path.exists(linux_bin) and os.access(linux_bin, os.X_OK):
+        return linux_bin
 
     which_ffmpeg = shutil.which("ffmpeg")
     if which_ffmpeg and os.path.exists(which_ffmpeg):
         return which_ffmpeg
 
-    candidates = [
-        "/usr/bin/ffmpeg",             # Default Debian/Ubuntu apt install location
-        "/usr/local/bin/ffmpeg",       # Common compiled/custom location
-        "/bin/ffmpeg",                 # Core binary path
-        "/opt/homebrew/bin/ffmpeg",    # macOS Apple Silicon
-        "/usr/local/opt/ffmpeg/bin/ffmpeg"
-    ]
-    for path in candidates:
+    for path in (
+        "/usr/local/bin/ffmpeg",
+        "/bin/ffmpeg",
+        "/opt/homebrew/bin/ffmpeg",
+        "/usr/local/opt/ffmpeg/bin/ffmpeg",
+    ):
         if os.path.exists(path) and os.access(path, os.X_OK):
             return path
 
-    return which_ffmpeg or "ffmpeg"
+    raise RuntimeError(
+        "FFmpeg binary not found. Install ffmpeg or set FFMPEG_PATH to the absolute binary path."
+    )
 
-FFMPEG_BIN = get_ffmpeg_binary()
-TEMP_DIR = os.path.abspath(tempfile.gettempdir())
+
+FFMPEG_BIN = None
+
+
+def ffmpeg_bin() -> str:
+    global FFMPEG_BIN
+    if not FFMPEG_BIN:
+        FFMPEG_BIN = get_ffmpeg_binary()
+    return FFMPEG_BIN
+
+
+def ensure_tmp_dirs() -> None:
+    os.makedirs(UPLOAD_TMP_DIR, exist_ok=True)
+    os.makedirs(AUDIO_TMP_DIR, exist_ok=True)
+
+
+def format_sec(sec: float) -> str:
+    total = max(0, int(sec))
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
+def safe_unlink(path: Optional[str]) -> None:
+    if not path:
+        return
+    try:
+        if os.path.isfile(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+async def stream_upload_to_tmp(upload_file, suffix: str = ".webm") -> str:
+    """Stream multipart video bytes straight to /tmp in 1MB chunks (no full RAM buffer)."""
+    ensure_tmp_dirs()
+    ext = os.path.splitext(getattr(upload_file, "filename", "") or "")[1] or suffix
+    dest = os.path.join(UPLOAD_TMP_DIR, f"vid_{int(time.time())}_{uuid.uuid4().hex[:10]}{ext}")
+    bytes_written = 0
+    with open(dest, "wb") as out:
+        while True:
+            chunk = await upload_file.read(STREAM_CHUNK_BYTES)
+            if not chunk:
+                break
+            out.write(chunk)
+            bytes_written += len(chunk)
+        out.flush()
+        os.fsync(out.fileno())
+    if bytes_written == 0:
+        safe_unlink(dest)
+        raise RuntimeError("Uploaded video footage is empty (0 bytes).")
+    print(f"[ingest] Streamed {bytes_written} bytes to {dest}")
+    return dest
+
 
 def extract_wav_with_ffmpeg(video_path: str, output_wav_path: str) -> bool:
     """
-    Extracts 16kHz mono WAV from video using FFmpeg (-acodec pcm_s16le -ar 16000 -ac 1).
-    Enforces absolute os.path temp directory tracking, stream lookahead, and verifies
-    that output WAV is strictly greater than 0 bytes (and >= 44 bytes header) before passing to Groq.
+    Extract 16 kHz mono PCM WAV via FFmpeg at the absolute Linux binary path.
+    Audio is written under /tmp so long recordings do not sit in process memory.
     """
     abs_video = os.path.abspath(video_path)
     abs_output = os.path.abspath(output_wav_path)
-    abs_temp = os.path.abspath(tempfile.gettempdir())
-    os.makedirs(abs_temp, exist_ok=True)
-    os.makedirs(os.path.dirname(abs_output), exist_ok=True)
-    
-    # 1. Asynchronous file system lookahead: ensure video file stream handle is fully closed and stable on disk
-    last_size = -1
-    stable_checks = 0
-    for _ in range(10):
-        if not os.path.exists(abs_video):
-            time.sleep(0.05)
-            continue
-        try:
-            curr_size = os.path.getsize(abs_video)
-            # Test stream handle readability
-            with open(abs_video, "rb") as check_f:
-                check_f.read(1024)
-            if curr_size == last_size and curr_size > 0:
-                stable_checks += 1
-                if stable_checks >= 2:
-                    break
-            else:
-                stable_checks = 0
-                last_size = curr_size
-        except Exception:
-            stable_checks = 0
-        time.sleep(0.05)
+    os.makedirs(os.path.dirname(abs_output) or AUDIO_TMP_DIR, exist_ok=True)
 
     if not os.path.exists(abs_video) or os.path.getsize(abs_video) == 0:
-        raise RuntimeError(f"Video file at {abs_video} is missing or empty (0 bytes). Cannot extract audio.")
+        raise RuntimeError(f"Video file at {abs_video} is missing or empty.")
 
-    ffmpeg_bin = get_ffmpeg_binary()
-    in_size = os.path.getsize(abs_video)
-    print(f"[FFmpeg] Input video track: {abs_video} ({in_size} bytes, tempDir: {abs_temp}, bin: {ffmpeg_bin})")
-    
+    binary = ffmpeg_bin()
     cmd = [
-        ffmpeg_bin,
+        binary,
+        "-hide_banner",
+        "-nostdin",
         "-y",
         "-i", abs_video,
         "-vn",
         "-acodec", "pcm_s16le",
         "-ar", "16000",
         "-ac", "1",
-        abs_output
+        "-f", "wav",
+        abs_output,
     ]
-    
+    print(f"[FFmpeg] {binary} extracting audio -> {abs_output}")
     try:
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
-    except FileNotFoundError:
-        print(f"[FFmpeg] Binary {ffmpeg_bin} not found, falling back to 'ffmpeg' in PATH")
-        cmd[0] = "ffmpeg"
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("FFmpeg extraction timed out after 120 seconds.")
+        res = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=None,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"FFmpeg binary not executable at {binary}") from exc
 
     if res.returncode != 0:
         err = res.stderr.decode("utf-8", errors="ignore")
-        print(f"[FFmpeg] Hard Error during extraction: {err}")
-        raise RuntimeError(f"FFmpeg audio extraction failed: {err}")
-    
+        raise RuntimeError(f"FFmpeg audio extraction failed: {err[-2000:]}")
+
     out_size = os.path.getsize(abs_output) if os.path.exists(abs_output) else 0
-    # Strict validation: output WAV file must be greater than 0 bytes and >= 44 bytes header
-    if not os.path.exists(abs_output) or out_size == 0:
-        print(f"[FFmpeg] ERROR: Output audio file size is 0 bytes for {abs_output}")
-        raise RuntimeError(f"Output audio file is missing or 0 bytes for {abs_output}. Cannot pass to Groq Whisper Large-V3.")
-
-    if out_size < 44:
-        print(f"[FFmpeg] ERROR: Output audio file size is {out_size} bytes (<44 bytes header) for {abs_output}")
-        raise RuntimeError(f"Output audio file size is {out_size} bytes (less than 44-byte WAV header) for {abs_output}. Cannot pass to Groq Whisper Large-V3.")
-
-    # Duration matching validation to prevent partial ingestion
-    def probe_dur(fpath: str) -> Optional[float]:
-        try:
-            p = subprocess.run([ffmpeg_bin, "-i", fpath], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            out = p.stderr.decode("utf-8", errors="ignore")
-            m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.?\d*)", out)
-            if m:
-                return float(m.group(1)) * 3600 + float(m.group(2)) * 60 + float(m.group(3))
-        except Exception:
-            pass
-        return None
-
-    v_dur = probe_dur(abs_video)
-    a_dur = probe_dur(abs_output)
-    print(f"[FFmpeg] Duration check: Video={v_dur}s, Audio={a_dur}s")
-    if v_dur and v_dur > 0:
-        if out_size < 44:
-            raise RuntimeError(f"Input video duration is {v_dur:.2f}s, but output WAV size is {out_size} bytes (<44 bytes header). Partial ingestion blocked.")
-        if a_dur and v_dur > 1.5:
-            diff = abs(v_dur - a_dur)
-            if diff > 2.5 and (diff / v_dur) > 0.15:
-                raise RuntimeError(f"Audio extraction truncated! Video duration ({v_dur:.1f}s) does not match audio stream duration ({a_dur:.1f}s). Terminated to prevent partial ingestion.")
-
-    print(f"[FFmpeg] Extracted 16kHz mono WAV: {abs_output} ({out_size} bytes)")
+    if out_size < WAV_HEADER_BYTES:
+        raise RuntimeError(
+            f"Extracted WAV is missing or too small ({out_size} bytes). Cannot send to Groq Whisper-large-v3."
+        )
+    print(f"[FFmpeg] WAV ready: {abs_output} ({out_size} bytes)")
     return True
 
-def format_sec(sec: float) -> str:
-    m = int(sec // 60)
-    s = int(sec % 60)
-    return f"{m:02d}:{s:02d}"
+
+def _split_wav_chunks(wav_path: str) -> List[str]:
+    size = os.path.getsize(wav_path)
+    if size <= GROQ_MAX_UPLOAD_BYTES:
+        return [wav_path]
+
+    duration = _probe_duration(wav_path) or max(1.0, size / 32000.0)
+    bytes_per_sec = size / duration
+    chunk_sec = max(30.0, (GROQ_MAX_UPLOAD_BYTES * 0.85) / max(bytes_per_sec, 1.0))
+    chunks: List[str] = []
+    start = 0.0
+    idx = 0
+    binary = ffmpeg_bin()
+    while start < duration - 0.05:
+        dest = os.path.join(
+            AUDIO_TMP_DIR,
+            f"{os.path.splitext(os.path.basename(wav_path))[0]}_part{idx}.wav",
+        )
+        cmd = [
+            binary, "-hide_banner", "-nostdin", "-y",
+            "-ss", f"{start:.3f}",
+            "-t", f"{chunk_sec:.3f}",
+            "-i", wav_path,
+            "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+            dest,
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if res.returncode != 0 or not os.path.exists(dest) or os.path.getsize(dest) < WAV_HEADER_BYTES:
+            raise RuntimeError("Failed to split long meeting audio for Groq upload limits.")
+        chunks.append(dest)
+        start += chunk_sec
+        idx += 1
+    return chunks
+
+
+def _probe_duration(fpath: str) -> Optional[float]:
+    try:
+        res = subprocess.run(
+            [ffmpeg_bin(), "-hide_banner", "-i", fpath],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        out = res.stderr.decode("utf-8", errors="ignore")
+        match = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.?\d*)", out)
+        if match:
+            return float(match.group(1)) * 3600 + float(match.group(2)) * 60 + float(match.group(3))
+    except Exception:
+        return None
+    return None
+
+
+def _parse_groq_payload(
+    groq_data: Dict[str, Any],
+    host_name: str,
+    guest_name: str,
+    time_offset: float,
+) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
+    raw_segments = sorted(groq_data.get("segments") or [], key=lambda s: float(s.get("start", 0.0)))
+    raw_text = (groq_data.get("text") or "").strip()
+    dialogue_turns: List[Dict[str, Any]] = []
+    dialogue_lines: List[str] = []
+    shifted_segments: List[Dict[str, Any]] = []
+
+    for idx, seg in enumerate(raw_segments):
+        text = (seg.get("text") or "").strip()
+        if not text:
+            continue
+        start = float(seg.get("start", 0.0)) + time_offset
+        end = float(seg.get("end", start + 0.5)) + time_offset
+        speaker, spoken = _speaker_from_text(text, host_name, guest_name)
+        shifted = dict(seg)
+        shifted["start"] = start
+        shifted["end"] = end
+        shifted["text"] = spoken
+        shifted["speaker"] = speaker
+        shifted_segments.append(shifted)
+        is_host = speaker.lower() == host_name.lower()
+        dialogue_turns.append({
+            "id": f"turn_{idx}_{int(start * 1000)}",
+            "speaker": speaker,
+            "role": "Host" if is_host else "Participant",
+            "isHost": is_host,
+            "text": spoken,
+            "timestamp": format_sec(start),
+            "start": start,
+            "end": end,
+        })
+        dialogue_lines.append(f"{speaker}: {spoken}")
+
+    if not dialogue_turns and raw_text:
+        speaker, spoken = _speaker_from_text(raw_text, host_name, guest_name)
+        dialogue_turns.append({
+            "id": "turn_0",
+            "speaker": speaker,
+            "role": "Host" if speaker.lower() == host_name.lower() else "Participant",
+            "isHost": speaker.lower() == host_name.lower(),
+            "text": spoken,
+            "timestamp": format_sec(time_offset),
+            "start": time_offset,
+            "end": time_offset + max(1.0, len(spoken.split()) * 0.4),
+        })
+        dialogue_lines.append(f"{speaker}: {spoken}")
+        shifted_segments.append({
+            "start": time_offset,
+            "end": time_offset + 1.0,
+            "text": spoken,
+            "speaker": speaker,
+        })
+
+    formatted = "\n".join(dialogue_lines) if dialogue_lines else raw_text
+    return formatted, dialogue_turns, shifted_segments
+
+
+def _speaker_from_text(text: str, host_name: str, guest_name: str) -> Tuple[str, str]:
+    tag_match = re.match(r"^(?:Speaker\s*([0-9]+)|([A-Za-z0-9_ \-]{1,40})):\s*(.+)$", text, re.I)
+    if not tag_match:
+        return host_name, text
+    spoken = tag_match.group(3).strip()
+    if tag_match.group(1) is not None:
+        spk_num = int(tag_match.group(1))
+        return (host_name if spk_num == 0 else guest_name), spoken
+    name_part = tag_match.group(2).strip()
+    lower = name_part.lower()
+    if guest_name and guest_name.lower() in lower:
+        return guest_name, spoken
+    if host_name and host_name.lower() in lower:
+        return host_name, spoken
+    return name_part, spoken
+
 
 async def transcribe_audio(
     wav_path: str,
-    host_name: str = "ABHIGOWDA819761",
+    host_name: str = "Host",
     guest_name: str = "Participant",
-    groq_api_key: Optional[str] = None
+    groq_api_key: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Transcribes audio using Groq Whisper Large-V3 if key provided;
-    otherwise uses local faster-whisper model.
-    """
-    groq_key = groq_api_key or os.getenv("GROQ_API_KEY", "")
-    wav_size = os.path.getsize(wav_path) if os.path.exists(wav_path) else 0
-    print(f"[transcribe_audio] Preparing audio transcription for {host_name} and {guest_name} (WAV size: {wav_size} bytes)")
-    
-    # 1. Try Groq Whisper Large-V3
-    if groq_key:
-        try:
-            import httpx
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                with open(wav_path, "rb") as f:
-                    files = {"file": (os.path.basename(wav_path), f, "audio/wav")}
+    """Send extracted WAV to Groq Whisper-large-v3 and return the live dialogueScript."""
+    groq_key = (groq_api_key or os.getenv("GROQ_API_KEY") or "").strip()
+    if not groq_key:
+        raise RuntimeError("GROQ_API_KEY is not set in the environment.")
+    if not os.path.exists(wav_path) or os.path.getsize(wav_path) < WAV_HEADER_BYTES:
+        raise RuntimeError(f"WAV missing or empty: {wav_path}")
+
+    chunk_paths = await asyncio.to_thread(_split_wav_chunks, wav_path)
+    all_turns: List[Dict[str, Any]] = []
+    all_segments: List[Dict[str, Any]] = []
+    script_parts: List[str] = []
+    time_offset = 0.0
+
+    try:
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            for chunk_path in chunk_paths:
+                chunk_dur = _probe_duration(chunk_path) or 0.0
+                with open(chunk_path, "rb") as handle:
+                    files = {"file": (os.path.basename(chunk_path), handle, "audio/wav")}
                     data = {
-                        "model": "whisper-large-v3",
+                        "model": GROQ_WHISPER_MODEL,
                         "response_format": "verbose_json",
                         "temperature": "0.0",
-                        "prompt": f"Meeting conversation between {host_name} and {guest_name}."
                     }
                     headers = {"Authorization": f"Bearer {groq_key}"}
                     resp = await client.post(
-                        "https://api.groq.com/openai/v1/audio/transcriptions",
+                        GROQ_TRANSCRIBE_URL,
                         files=files,
                         data=data,
-                        headers=headers
+                        headers=headers,
                     )
-                
-                if resp.status_code == 200:
-                    groq_data = resp.json()
-                    raw_segments = groq_data.get("segments", [])
-                    # Chronological sorting of Groq response segments
-                    segments = sorted(raw_segments, key=lambda s: float(s.get("start", 0.0)))
-                    raw_text = groq_data.get("text", "").strip()
-                    
-                    dialogue_turns = []
-                    dialogue_lines = []
-                    
-                    if segments:
-                        for idx, seg in enumerate(segments):
-                            text = seg.get("text", "").strip()
-                            if not text:
-                                continue
-                            start = seg.get("start", 0.0)
-                            ts = format_sec(start)
-                            
-                            # Dynamic Speaker Tag Detection (e.g., Speaker 1:, Participant:)
-                            spk = host_name
-                            tag_match = re.match(r'^(?:Speaker\s*([0-9]+)|([a-zA-Z0-9_\s]+)):\s*(.+)$', text, re.I)
-                            if tag_match:
-                                if tag_match.group(1) is not None:
-                                    spk_num = int(tag_match.group(1))
-                                    spk = host_name if spk_num == 0 else guest_name
-                                elif tag_match.group(2):
-                                    name_part = tag_match.group(2).strip().lower()
-                                    if guest_name and guest_name.lower() in name_part:
-                                        spk = guest_name
-                                    elif host_name and host_name.lower() in name_part:
-                                        spk = host_name
-                                    else:
-                                        spk = tag_match.group(2).strip()
-                                text = tag_match.group(3).strip()
-                            
-                            is_host = (spk.lower() == host_name.lower())
-                            dialogue_turns.append({
-                                "id": f"turn_{idx}",
-                                "speaker": spk,
-                                "role": "Host" if is_host else "Participant",
-                                "isHost": is_host,
-                                "text": text,
-                                "timestamp": ts,
-                                "start": start,
-                                "end": seg.get("end", start + 2.0)
-                            })
-                            dialogue_lines.append(f"{spk}: {text}")
-                    elif raw_text:
-                        sentences = [s.strip() for s in re.split(r'(?<=[.?!])\s+', raw_text) if s.strip()]
-                        for idx, s in enumerate(sentences):
-                            tag_match = re.match(r'^(?:Speaker\s*([0-9]+)|([a-zA-Z0-9_\s]+)):\s*(.+)$', s, re.I)
-                            if tag_match:
-                                spk = guest_name if tag_match.group(1) == "1" else host_name
-                                text_clean = tag_match.group(3).strip()
-                            else:
-                                spk = host_name
-                                text_clean = s
-                            is_host = (spk == host_name)
-                            dialogue_turns.append({
-                                "id": f"turn_{idx}",
-                                "speaker": spk,
-                                "role": "Host" if is_host else "Participant",
-                                "isHost": is_host,
-                                "text": text_clean,
-                                "timestamp": format_sec(idx * 4.0)
-                            })
-                            dialogue_lines.append(f"{spk}: {text_clean}")
-                    
-                    # If Groq transcription array returns empty, block the pipeline from writing blank fields
-                    if not dialogue_turns and not raw_text:
-                        print(f"[transcribe_audio] ERROR: Groq Whisper transcription returned empty segments for {wav_path}. Blocking pipeline.")
-                        raise RuntimeError(f"Groq Whisper transcription returned empty segments for {wav_path}. Audio contains no detectable speech.")
+                if resp.status_code != 200:
+                    raise RuntimeError(
+                        f"Groq Whisper-large-v3 failed ({resp.status_code}): {resp.text[:800]}"
+                    )
+                formatted, turns, segs = _parse_groq_payload(
+                    resp.json(), host_name, guest_name, time_offset
+                )
+                if formatted:
+                    script_parts.append(formatted)
+                all_turns.extend(turns)
+                all_segments.extend(segs)
+                time_offset += chunk_dur
+    finally:
+        for path in chunk_paths:
+            if path != wav_path:
+                safe_unlink(path)
 
-                    formatted_transcript = "\n".join(dialogue_lines) if dialogue_lines else raw_text
-                    return {
-                        "model": "whisper-large-v3 (Groq API)",
-                        "rawTranscript": formatted_transcript,
-                        "dialogueTurns": dialogue_turns,
-                        "text": formatted_transcript,
-                        "segments": segments,
-                        "groqSegments": segments
-                    }
-        except Exception as e:
-            print(f"[transcribe_audio] Groq API error: {e}, falling back to local faster-whisper")
-    
-    # 2. Local faster-whisper fallback
-    try:
-        from faster_whisper import WhisperModel
-        # Use lightweight model for real-time responsiveness
-        model = WhisperModel("base", device="cpu", compute_type="int8")
-        segments_gen, info = model.transcribe(wav_path, beam_size=5)
-        
-        dialogue_turns = []
-        dialogue_lines = []
-        curr_speaker = host_name
-        prev_end = 0.0
-        
-        idx = 0
-        for seg in segments_gen:
-            text = seg.text.strip()
-            if not text:
-                continue
-            if idx > 0 and (seg.start - prev_end) > 1.0:
-                curr_speaker = guest_name if curr_speaker == host_name else host_name
-            
-            is_host = (curr_speaker == host_name)
-            dialogue_turns.append({
-                "id": f"turn_{idx}",
-                "speaker": curr_speaker,
-                "role": "Host" if is_host else "Participant",
-                "isHost": is_host,
-                "text": text,
-                "timestamp": format_sec(seg.start),
-                "start": seg.start,
-                "end": seg.end
-            })
-            dialogue_lines.append(f"{curr_speaker}: {text}")
-            prev_end = seg.end
-            idx += 1
-            
-        formatted_transcript = "\n".join(dialogue_lines) if dialogue_lines else ""
-        return {
-            "model": "faster-whisper-base (Local CPU)",
-            "rawTranscript": formatted_transcript,
-            "dialogueTurns": dialogue_turns,
-            "text": formatted_transcript,
-            "segments": dialogue_turns,
-            "groqSegments": dialogue_turns
-        }
-    except Exception as local_err:
-        print(f"[transcribe_audio] Local whisper error: {local_err}")
-        return {
-            "model": "whisper-large-v3",
-            "rawTranscript": "",
-            "dialogueTurns": [],
-            "text": "",
-            "segments": [],
-            "groqSegments": []
-        }
+    dialogue_script = "\n".join(p for p in script_parts if p).strip()
+    if not dialogue_script or not all_turns:
+        raise RuntimeError(
+            "Groq Whisper-large-v3 returned no speech from the uploaded meeting video."
+        )
+
+    print(f"[Groq] dialogueScript captured: {len(all_turns)} turns, {len(dialogue_script)} chars")
+    return {
+        "model": GROQ_WHISPER_MODEL,
+        "rawTranscript": dialogue_script,
+        "dialogueScript": dialogue_script,
+        "dialogueTurns": all_turns,
+        "text": dialogue_script,
+        "segments": all_segments,
+        "groqSegments": all_segments,
+    }
+
 
 async def generate_groq_summary(raw_transcript: str, groq_api_key: Optional[str] = None) -> str:
-    """
-    Uses Groq to generate a concise summary field ('meetingSummary')
-    based strictly and exclusively on the captured words.
-    """
-    groq_key = groq_api_key or os.getenv("GROQ_API_KEY", "")
-    if not groq_key or not raw_transcript.strip():
+    groq_key = (groq_api_key or os.getenv("GROQ_API_KEY") or "").strip()
+    transcript = (raw_transcript or "").strip()
+    if not groq_key or not transcript:
         return ""
     try:
-        import httpx
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=45.0) as client:
             resp = await client.post(
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"},
@@ -339,70 +411,82 @@ async def generate_groq_summary(raw_transcript: str, groq_api_key: Optional[str]
                     "messages": [
                         {
                             "role": "system",
-                            "content": "You are a concise executive meeting summarizer. Generate a 2-3 sentence summary strictly and exclusively based on the verbatim words spoken in the transcript. Do not assume or hallucinate unmentioned context."
+                            "content": (
+                                "Summarize only the verbatim meeting transcript. "
+                                "Do not invent names, decisions, or topics that are not spoken."
+                            ),
                         },
                         {
                             "role": "user",
-                            "content": f"Verbatim Meeting Transcript:\n{raw_transcript}\n\nProvide the concise meeting summary:"
-                        }
+                            "content": f"Verbatim Meeting Transcript:\n{transcript}\n\nConcise summary:",
+                        },
                     ],
                     "temperature": 0.1,
-                    "max_tokens": 250
-                }
+                    "max_tokens": 250,
+                },
             )
             if resp.status_code == 200:
-                data = resp.json()
-                summary = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-                return summary
-    except Exception as e:
-        print(f"[generate_groq_summary] Groq summarization notice: {e}")
+                return (
+                    resp.json()
+                    .get("choices", [{}])[0]
+                    .get("message", {})
+                    .get("content", "")
+                    .strip()
+                )
+    except Exception as exc:
+        print(f"[generate_groq_summary] {exc}")
     return ""
 
-def extract_speaker_linguistic_metrics(segments: List[Dict], host_name: str, guest_name: str) -> Dict[str, Dict]:
-    """
-    Counts exact words, characters, and segments per detected user profile.
-    Filters out background sound tags like [Applause], [Music], [Laughter] and no_speech_prob > 0.8.
-    """
-    metrics = {
-        host_name: {"words": 0, "chars": 0, "segments": 0, "fillers": 0},
-        guest_name: {"words": 0, "chars": 0, "segments": 0, "fillers": 0}
-    }
-    filler_regex = re.compile(r'\b(uh|um|uhm|ah|er|like|you know|sort of|kind of)\b', re.IGNORECASE)
-    sound_artifacts_regex = re.compile(r'\[(applause|music|laughter|silence|whispering|cough|throat clearing)\]', re.IGNORECASE)
 
-    for seg in (segments or []):
+def extract_speaker_linguistic_metrics(
+    segments: List[Dict],
+    host_name: str,
+    guest_name: str,
+) -> Dict[str, Dict]:
+    metrics: Dict[str, Dict[str, int]] = {}
+    filler_regex = re.compile(
+        r"\b(uh|um|uhm|ah|er|like|you know|sort of|kind of)\b", re.IGNORECASE
+    )
+    sound_artifacts_regex = re.compile(
+        r"\[(applause|music|laughter|silence|whispering|cough|throat clearing)\]",
+        re.IGNORECASE,
+    )
+
+    for seg in segments or []:
         text = seg.get("text", "")
-        if seg.get("no_speech_prob", 0) > 0.8:
+        if float(seg.get("no_speech_prob", 0) or 0) > 0.8:
             continue
         cleaned = sound_artifacts_regex.sub("", text).strip()
         if not cleaned:
             continue
-
-        spk = seg.get("speaker") or seg.get("speaker_id") or host_name
-        tag_match = re.match(r'^(?:Speaker\s*([0-9]+)|([a-zA-Z0-9_\s]+)):\s*(.+)$', cleaned, re.I)
+        spk = (seg.get("speaker") or seg.get("speaker_id") or host_name).strip() or host_name
+        tag_match = re.match(
+            r"^(?:Speaker\s*([0-9]+)|([A-Za-z0-9_ \-]{1,40})):\s*(.+)$", cleaned, re.I
+        )
         if tag_match:
             if tag_match.group(1) is not None:
                 spk = host_name if int(tag_match.group(1)) == 0 else guest_name
             elif tag_match.group(2):
-                name_part = tag_match.group(2).strip().lower()
-                if guest_name and guest_name.lower() in name_part:
-                    spk = guest_name
-                elif host_name and host_name.lower() in name_part:
-                    spk = host_name
+                spk = tag_match.group(2).strip()
             cleaned = tag_match.group(3).strip()
+        bucket = metrics.setdefault(
+            spk, {"words": 0, "chars": 0, "segments": 0, "fillers": 0}
+        )
+        bucket["words"] += len(cleaned.split())
+        bucket["chars"] += len(cleaned)
+        bucket["segments"] += 1
+        bucket["fillers"] += len(filler_regex.findall(cleaned))
 
-        words = len(cleaned.split())
-        chars = len(cleaned)
-        fillers = len(filler_regex.findall(cleaned))
-
-        target_key = host_name if (spk.lower() == host_name.lower() or "host" in spk.lower() or spk == "Speaker 0") else guest_name
-        if target_key in metrics:
-            metrics[target_key]["words"] += words
-            metrics[target_key]["chars"] += chars
-            metrics[target_key]["segments"] += 1
-            metrics[target_key]["fillers"] += fillers
-
+    for name in (host_name, guest_name):
+        metrics.setdefault(name, {"words": 0, "chars": 0, "segments": 0, "fillers": 0})
     return metrics
+
+
+def _strip_json_fence(text: str) -> str:
+    cleaned = text.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    return cleaned.strip()
 
 
 async def analyze_with_gemini(
@@ -411,129 +495,121 @@ async def analyze_with_gemini(
     host_name: str = "Host",
     guest_name: str = "Participant",
     gemini_api_key: Optional[str] = None,
-    segments: Optional[List[Dict]] = None
+    segments: Optional[List[Dict]] = None,
 ) -> Dict[str, Any]:
     """
-    Executes Gemini 1.5 Flash analysis with literal metrics compliance auditor prompt.
-    Passes raw Groq timestamped segments and enforces Anti-Hallucination Gate (< 50 chars).
+    Feed the identical Groq transcription into Gemini 1.5 Flash.
+    Gemini independently computes compliance, cross-examination, and the scorecard.
     """
-    gemini_key = gemini_api_key or os.getenv("GEMINI_API_KEY", "")
-    
-    # Compute exact linguistic telemetry per speaker
+    gemini_key = (gemini_api_key or os.getenv("GEMINI_API_KEY") or "").strip()
+    if not gemini_key:
+        raise RuntimeError("GEMINI_API_KEY is not set in the environment.")
+    transcript = (raw_transcript or "").strip()
+    if not transcript:
+        raise RuntimeError("Cannot call Gemini without a live Groq dialogueScript.")
+
     analysis_segments = segments if (segments and len(segments) > 0) else dialogue_turns
     linguistic_metrics = extract_speaker_linguistic_metrics(analysis_segments, host_name, guest_name)
-    host_ling = linguistic_metrics.get(host_name, {"words": 0, "chars": 0, "segments": 0})
-    guest_ling = linguistic_metrics.get(guest_name, {"words": 0, "chars": 0, "segments": 0})
+    groq_timestamped_data = []
+    for seg in analysis_segments:
+        groq_timestamped_data.append({
+            "start": seg.get("start", 0),
+            "end": seg.get("end", 0),
+            "speaker": seg.get("speaker") or (host_name if seg.get("isHost", True) else guest_name),
+            "text": seg.get("text", ""),
+        })
 
-    # Strict dynamic active speaker inspection:
-    guest_spoke = bool(
-        guest_name
-        and guest_name.lower() != host_name.lower()
-        and guest_ling["words"] >= 10
-        and guest_ling["segments"] > 0
-    )
+    spoken_names = []
+    for turn in dialogue_turns:
+        name = (turn.get("speaker") or "").strip()
+        if name and name not in spoken_names:
+            spoken_names.append(name)
+    speakers_str = ", ".join(spoken_names) if spoken_names else host_name
 
-    if gemini_key:
-        try:
-            import httpx
-            speakers_list = [host_name]
-            if guest_spoke:
-                speakers_list.append(guest_name)
-            speakers_str = ", ".join(f'"{s}"' for s in speakers_list)
+    prompt = f"""You are a literal metrics compliance auditor. You have no creative freedom.
+Score ONLY speakers who actually produced words in the Groq transcript: {speakers_str}.
+Do not invent speakers, questions, answers, claims, or scores for anyone who did not speak.
 
-            # Untampered timestamped text array directly from Groq
-            groq_timestamped_data = []
-            for seg in analysis_segments:
-                groq_timestamped_data.append({
-                    "start": seg.get("start", 0),
-                    "end": seg.get("end", 0),
-                    "speaker": seg.get("speaker") or (host_name if seg.get("isHost", True) else guest_name),
-                    "text": seg.get("text", "")
-                })
+Use the Groq transcript as the sole evidence source.
+For each active speaker return integer scores 1-10 for:
+- communication_skills
+- fluency
+- confidence
+- awkwardness (1 if no filler words; higher only when uh/um/stammers appear)
+- straightforward_answers
+Include a rationale that quotes verbatim words from the transcript.
 
-            guest_schema_block = f""",
-  "{guest_name}": {{
-    "communication_skills": 7,
-    "fluency": 7,
-    "confidence": 7,
-    "awkwardness": 1,
-    "straightforward_answers": 7,
-    "rationale": "Direct linguistic evidence here"
-  }}""" if guest_spoke else ""
+Also perform objective cross-examination:
+- factCheckAudit: only real question/answer pairs between different speakers. Empty array if none.
+- compliance: overall meeting-compliance notes grounded in the spoken text.
+- scorecard: the same per-speaker metrics plus any additional behavioral observations justified by the transcript.
 
-            prompt = f"""You are a literal metrics compliance auditor. You have 0% creative freedom. You must justify every single digit assigned out of 10 using direct linguistic evidence from the provided Groq text string.
-
-CRITICAL INGESTION BINDING & AUDIT RULES:
-1. Only evaluate active participants who produced spoken dialogue in the Groq data: {speakers_str}.
-2. If a user has not spoken a single word or contains less than 10 words / background sound artifacts, DO NOT evaluate them, DO NOT assign scores, and completely exclude them from the JSON response.
-3. Every score (1 to 10) must strictly adhere to the following rigid grading parameters:
-   - communication_skills: Grade based on structural vocabulary and clarity in the text.
-   - fluency: Measure based on the frequency of sentence completions vs. repetitive stuttering loops present in the Groq timestamps.
-   - confidence: Assess based on declarative phrasing vs. uncertain conditional statements.
-   - awkwardness: Count explicit filler artifacts (like uh, um, long pauses) captured by Whisper Large-V3. If none exist, the score must be clamped tightly at 1.
-   - straightforward_answers: Match questions asked directly against the immediate subsequent response block text. If the text deflects, drop the score heavily.
-4. For each evaluated speaker, provide the numeric score (1-10) for all 5 metrics, AND a concise rationale citing direct linguistic evidence (e.g. quote verbatim words, filler count, or state Insufficient spoken text for evaluation if data is scarce).
-
-Raw Untampered Groq Timestamped Dialogue Segments:
-{json.dumps(groq_timestamped_data, indent=2)}
-
-Full Verbatim Transcript:
-{raw_transcript}
-
-Task 2: Verbatim Fact-Checking Extraction
-Perform a direct string lookup from the text dialogue:
-- Map verbatim questions asked to exact verbatim answers given.
-- question_by: Must match the speaker who asked.
-- answered_by: Must match the speaker who answered.
-- The question and answer MUST be an actual conversational exchange between different users in the text.
-- The verdict must strictly follow one of: Accurate, Incomplete, or Evasive.
-- If no literal question-and-answer exchange exists between different users in the text, factCheckAudit must be strictly an empty array. Do not invent sample dialogues.
-
-Return ONLY a valid JSON object. Use this exact structure:
+Return ONLY JSON with this shape (types, not sample values):
 {{
-  "{host_name}": {{
-    "communication_skills": 7,
-    "fluency": 8,
-    "confidence": 7,
-    "awkwardness": 1,
-    "straightforward_answers": 7,
-    "rationale": "Direct linguistic evidence here"
-  }}{guest_schema_block},
-  "factCheckAudit": []
+  "speakerRatings": {{
+    "<exact speaker name from transcript>": {{
+      "communication_skills": <int 1-10>,
+      "fluency": <int 1-10>,
+      "confidence": <int 1-10>,
+      "awkwardness": <int 1-10>,
+      "straightforward_answers": <int 1-10>,
+      "rationale": "<verbatim-backed string>"
+    }}
+  }},
+  "factCheckAudit": [
+    {{
+      "question_by": "<speaker>",
+      "question": "<verbatim question>",
+      "answered_by": "<speaker>",
+      "answer": "<verbatim answer>",
+      "verdict": "Accurate" | "Incomplete" | "Evasive"
+    }}
+  ],
+  "compliance": {{
+    "summary": "<string>",
+    "issues": ["<string>"]
+  }},
+  "scorecard": {{}},
+  "claims": [],
+  "actionItems": [],
+  "summary": "<string derived only from spoken words>"
 }}
 
-IMPORTANT: Replace ALL numeric values above with the actual scores you derive from the transcript evidence. Do not use placeholder text. Return only raw JSON, no markdown code fences."""
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={gemini_key}"
-            payload = {
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "temperature": 0.0,
-                    "responseMimeType": "application/json"
-                }
-            }
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.post(url, json=payload)
-                if resp.status_code == 200:
-                    resp_json = resp.json()
-                    candidates = resp_json.get("candidates", [])
-                    if candidates:
-                        candidate = candidates[0]
-                        finish_reason = candidate.get("finishReason", "")
-                        # Guard: empty/blocked candidate from content filter
-                        if finish_reason in ("SAFETY", "OTHER", "RECITATION") or not candidate.get("content"):
-                            print(f"[analyze_with_gemini] Gemini blocked/empty candidate. finishReason={finish_reason}. Using deterministic fallback.")
-                        else:
-                            text_content = candidate.get("content", {}).get("parts", [{}])[0].get("text", "")
-                            clean_json = re.sub(r"^```json\s*", "", text_content.strip(), flags=re.MULTILINE)
-                            clean_json = re.sub(r"```$", "", clean_json.strip(), flags=re.MULTILINE)
-                            parsed = json.loads(clean_json)
-                            if parsed and isinstance(parsed, dict):
-                                return _validate_and_clamp_analysis(parsed, host_name, guest_name, "gemini-1.5-flash", guest_spoke, linguistic_metrics)
-        except Exception as gemini_err:
-            print(f"[analyze_with_gemini] Gemini API call note: {gemini_err}")
-    
-    # Grounded Deterministic Fallback
-    return _grounded_deterministic_analysis(dialogue_turns, host_name, guest_name, guest_spoke, linguistic_metrics)
+Raw Groq timestamped segments:
+{json.dumps(groq_timestamped_data, indent=2)}
+
+Full verbatim dialogueScript:
+{transcript}
+"""
+
+    url = f"{GEMINI_URL}?key={gemini_key}"
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.0,
+            "responseMimeType": "application/json",
+        },
+    }
+    async with httpx.AsyncClient(timeout=90.0) as client:
+        resp = await client.post(url, json=payload)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Gemini 1.5 Flash failed ({resp.status_code}): {resp.text[:800]}")
+
+    resp_json = resp.json()
+    candidates = resp_json.get("candidates") or []
+    if not candidates:
+        raise RuntimeError("Gemini 1.5 Flash returned no candidates for the live transcript.")
+    candidate = candidates[0]
+    finish_reason = candidate.get("finishReason", "")
+    if finish_reason in ("SAFETY", "RECITATION") or not candidate.get("content"):
+        raise RuntimeError(f"Gemini 1.5 Flash blocked the live analysis (finishReason={finish_reason}).")
+    text_content = candidate.get("content", {}).get("parts", [{}])[0].get("text", "")
+    parsed = json.loads(_strip_json_fence(text_content))
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Gemini 1.5 Flash did not return a JSON object.")
+    return _validate_and_clamp_analysis(
+        parsed, host_name, guest_name, GEMINI_MODEL, linguistic_metrics, dialogue_turns
+    )
 
 
 def _validate_and_clamp_analysis(
@@ -541,45 +617,48 @@ def _validate_and_clamp_analysis(
     host_name: str,
     guest_name: str,
     model_name: str,
-    guest_spoke: bool = False,
-    linguistic_metrics: Optional[Dict] = None
+    linguistic_metrics: Optional[Dict] = None,
+    dialogue_turns: Optional[List[Dict]] = None,
 ) -> Dict[str, Any]:
-    def clamp(v):
+    def clamp(value: Any) -> int:
         try:
-            return max(1, min(10, int(v)))
+            return max(1, min(10, int(value)))
         except (ValueError, TypeError):
-            return 1
+            raise RuntimeError("Gemini returned a non-numeric score; refusing fabricated defaults.")
 
     ling = linguistic_metrics or {}
-    host_ling = ling.get(host_name, {"words": 0, "chars": 0, "segments": 0, "fillers": 0})
-    guest_ling = ling.get(guest_name, {"words": 0, "chars": 0, "segments": 0, "fillers": 0})
+    ratings_source = parsed.get("speakerRatings") or parsed
+    if not isinstance(ratings_source, dict):
+        raise RuntimeError("Gemini scorecard missing speakerRatings object.")
 
-    ratings_source = parsed.get("speakerRatings", parsed)
-    host_raw = ratings_source.get(host_name, {})
+    spoken_names = []
+    for turn in dialogue_turns or []:
+        name = (turn.get("speaker") or "").strip()
+        if name and name not in spoken_names:
+            spoken_names.append(name)
+    if not spoken_names:
+        spoken_names = [host_name]
 
-    # Key mutation check
-    if not host_raw:
-        for k, v in ratings_source.items():
-            if k.lower() == host_name.lower() or "host" in k.lower() or k in ["Speaker 0", "speaker_0"]:
-                host_raw = v
-                break
-
-    def evaluate_guardrail(raw_data: Dict, spk_ling: Dict, spk_name: str) -> Dict[str, Any]:
-        chars = spk_ling.get("chars", 0)
-        words = spk_ling.get("words", 0)
-        segs = spk_ling.get("segments", 0)
-
-        comm = clamp(raw_data.get("communication_skills"))
-        flu = clamp(raw_data.get("fluency"))
-        conf = clamp(raw_data.get("confidence"))
-        # Awkwardness must track actual filler tokens ('uh', 'um'). If none exist, clamp tightly to 1/10
-        awk = clamp(raw_data.get("awkwardness")) if spk_ling.get("fillers", 0) > 0 else 1
-        straight = clamp(raw_data.get("straightforward_answers"))
-
-        # Anti-Hallucination Gate: If char count < 50 or words < 10, clamp safely to 1/10
+    speaker_ratings_dict: Dict[str, Any] = {}
+    for spk_name in spoken_names:
+        spk_ling = ling.get(spk_name) or ling.get(host_name if spk_name.lower() == host_name.lower() else guest_name) or {
+            "words": 0, "chars": 0, "segments": 0, "fillers": 0
+        }
+        raw_data = ratings_source.get(spk_name, {})
+        if not isinstance(raw_data, dict) or not raw_data:
+            for key, value in ratings_source.items():
+                if isinstance(key, str) and key.lower() == spk_name.lower() and isinstance(value, dict):
+                    raw_data = value
+                    break
+        if not raw_data:
+            # Gemini may nest scores at the root using the speaker name
+            continue
+        words = int(spk_ling.get("words", 0) or 0)
+        chars = int(spk_ling.get("chars", 0) or 0)
+        segs = int(spk_ling.get("segments", 0) or 0)
+        fillers = int(spk_ling.get("fillers", 0) or 0)
         if chars < 50 or words < 10:
-            print(f"[Anti-Hallucination Gate] Clamping {spk_name} ({chars} chars < 50, {words} words < 10) safely to 1/10.")
-            return {
+            speaker_ratings_dict[spk_name] = {
                 "communication_skills": 1,
                 "fluency": 1,
                 "confidence": 1,
@@ -590,143 +669,154 @@ def _validate_and_clamp_analysis(
                 "is_clamped": True,
                 "word_count": words,
                 "char_count": chars,
-                "segment_count": segs
+                "segment_count": segs,
             }
-
-        return {
-            "communication_skills": comm,
-            "fluency": flu,
-            "confidence": conf,
+            continue
+        awk = clamp(raw_data.get("awkwardness")) if fillers > 0 else 1
+        speaker_ratings_dict[spk_name] = {
+            "communication_skills": clamp(raw_data.get("communication_skills")),
+            "fluency": clamp(raw_data.get("fluency")),
+            "confidence": clamp(raw_data.get("confidence")),
             "awkwardness": awk,
-            "straightforward_answers": straight,
-            "rationale": raw_data.get("rationale") or "Verified against Groq transcription evidence.",
+            "straightforward_answers": clamp(raw_data.get("straightforward_answers")),
+            "rationale": (raw_data.get("rationale") or "").strip()
+            or "Scored from Groq transcript evidence.",
             "status_note": "Validated against Groq transcript",
             "is_clamped": False,
             "word_count": words,
             "char_count": chars,
-            "segment_count": segs
+            "segment_count": segs,
         }
 
-    speaker_ratings_dict = {
-        host_name: evaluate_guardrail(host_raw, host_ling, host_name)
-    }
-
-    # Only include guest in speaker ratings if guest actually spoke >= 10 words
-    if guest_spoke and guest_name and guest_name.lower() != host_name.lower() and guest_ling.get("words", 0) >= 10 and guest_ling.get("segments", 0) > 0:
-        guest_raw = ratings_source.get(guest_name, {})
-        if not guest_raw:
-            for k, v in ratings_source.items():
-                if k.lower() == guest_name.lower() or "participant" in k.lower() or "guest" in k.lower() or k in ["Speaker 1", "speaker_1"]:
-                    guest_raw = v
-                    break
-
-        speaker_ratings_dict[guest_name] = evaluate_guardrail(guest_raw, guest_ling, guest_name)
+    if not speaker_ratings_dict:
+        raise RuntimeError("Gemini returned no live speaker ratings for transcribed participants.")
 
     fact_check = []
-    for item in parsed.get("factCheckAudit", []):
+    for item in parsed.get("factCheckAudit") or []:
         if not isinstance(item, dict):
             continue
-        q = item.get("question", "").strip()
-        a = item.get("answer", "").strip()
-        if not q or not a:
+        question = str(item.get("question") or "").strip()
+        answer = str(item.get("answer") or "").strip()
+        if not question or not answer:
             continue
-        v_raw = str(item.get("verdict", "")).lower()
-        if "incom" in v_raw:
+        verdict_raw = str(item.get("verdict") or "").lower()
+        if "incom" in verdict_raw:
             verdict = "Incomplete"
-        elif "evas" in v_raw:
+        elif "evas" in verdict_raw:
             verdict = "Evasive"
         else:
             verdict = "Accurate"
         fact_check.append({
             "question_by": item.get("question_by") or host_name,
-            "question": q,
-            "answered_by": item.get("answered_by") or (guest_name if guest_spoke else host_name),
-            "answer": a,
-            "verdict": verdict
+            "question": question,
+            "answered_by": item.get("answered_by") or guest_name,
+            "answer": answer,
+            "verdict": verdict,
         })
+
+    compliance = parsed.get("compliance") if isinstance(parsed.get("compliance"), dict) else {}
+    scorecard = parsed.get("scorecard") if isinstance(parsed.get("scorecard"), dict) else speaker_ratings_dict
+    claims = parsed.get("claims") if isinstance(parsed.get("claims"), list) else []
+    action_items = parsed.get("actionItems") if isinstance(parsed.get("actionItems"), list) else []
+    summary = str(parsed.get("summary") or compliance.get("summary") or "").strip()
 
     return {
         "speakerRatings": speaker_ratings_dict,
         "factCheckAudit": fact_check,
-        "summary": f"Meeting for {host_name} successfully transcribed and analyzed.",
-        "gemini_model": model_name
+        "compliance": compliance,
+        "scorecard": scorecard,
+        "claims": claims,
+        "actionItems": action_items,
+        "summary": summary,
+        "gemini_model": model_name,
     }
 
 
-def _grounded_deterministic_analysis(
-    dialogue_turns: List[Dict],
+async def analyze_claim_with_gemini(claim: str, meeting_context: Optional[str] = None) -> Dict[str, Any]:
+    gemini_key = (os.getenv("GEMINI_API_KEY") or "").strip()
+    if not gemini_key:
+        raise RuntimeError("GEMINI_API_KEY is not set in the environment.")
+    claim_text = (claim or "").strip()
+    if not claim_text:
+        raise RuntimeError("Claim cannot be empty.")
+    prompt = (
+        "Fact-check this spoken meeting claim using only the supplied text. "
+        "Return JSON with keys claim, verdict, confidence (0-100), analysis. "
+        "Verdict must be one of: Accurate, Incomplete, Evasive, Needs Context, Plausible. "
+        "Do not invent supporting facts that are not in the claim or context.\n\n"
+        f"Claim: {claim_text}\n"
+        f"Meeting context: {(meeting_context or '').strip() or 'None provided'}"
+    )
+    url = f"{GEMINI_URL}?key={gemini_key}"
+    async with httpx.AsyncClient(timeout=45.0) as client:
+        resp = await client.post(
+            url,
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"temperature": 0.0, "responseMimeType": "application/json"},
+            },
+        )
+    if resp.status_code != 200:
+        raise RuntimeError(f"Gemini fact-check failed ({resp.status_code}): {resp.text[:800]}")
+    text_content = (
+        resp.json().get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+    )
+    parsed = json.loads(_strip_json_fence(text_content))
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Gemini fact-check did not return JSON.")
+    return {
+        "claim": claim_text,
+        "verdict": str(parsed.get("verdict") or "Needs Context"),
+        "confidence": int(parsed.get("confidence") or 0),
+        "analysis": str(parsed.get("analysis") or ""),
+        "timestamp": time.strftime("%H:%M:%S"),
+    }
+
+
+async def run_live_meeting_pipeline(
+    video_path: str,
     host_name: str,
     guest_name: str,
-    guest_spoke: bool = False,
-    linguistic_metrics: Optional[Dict] = None
+    groq_api_key: Optional[str] = None,
+    gemini_api_key: Optional[str] = None,
 ) -> Dict[str, Any]:
-    # Extract verbatim questions only
-    questions_found = []
-    for i, turn in enumerate(dialogue_turns):
-        text = turn.get("text", "").strip()
-        if "?" in text or any(text.lower().startswith(q) for q in ["what", "how", "why", "when", "where", "who", "is", "can", "could", "would"]):
-            answer_turn = dialogue_turns[i + 1] if i + 1 < len(dialogue_turns) else None
-            q_by = turn.get("speaker", host_name)
-            a_by = answer_turn.get("speaker", host_name) if answer_turn else host_name
-            a_text = answer_turn.get("text", "").strip() if answer_turn else ""
-            if a_text:
-                questions_found.append({
-                    "question_by": q_by,
-                    "question": text,
-                    "answered_by": a_by,
-                    "answer": a_text,
-                    "verdict": "Accurate"
-                })
-            if len(questions_found) >= 4:
-                break
+    """FFmpeg -> Groq Whisper-large-v3 -> Gemini 1.5 Flash on the same transcript."""
+    groq_key = (groq_api_key or os.getenv("GROQ_API_KEY") or "").strip()
+    gemini_key = (gemini_api_key or os.getenv("GEMINI_API_KEY") or "").strip()
+    if not groq_key:
+        raise RuntimeError("GROQ_API_KEY is not set in the environment.")
+    if not gemini_key:
+        raise RuntimeError("GEMINI_API_KEY is not set in the environment.")
 
-    ling = linguistic_metrics or extract_speaker_linguistic_metrics(dialogue_turns, host_name, guest_name)
-    host_ling = ling.get(host_name, {"words": 0, "chars": 0, "segments": 0})
-    guest_ling = ling.get(guest_name, {"words": 0, "chars": 0, "segments": 0})
-    
-    def score_or_insufficient(spk_ling):
-        chars = spk_ling.get("chars", 0)
-        words = spk_ling.get("words", 0)
-        segs = spk_ling.get("segments", 0)
-        if chars < 50 or words == 0:
-            return {
-                "communication_skills": 1,
-                "fluency": 1,
-                "confidence": 1,
-                "awkwardness": 1,
-                "straightforward_answers": 1,
-                "rationale": "Insufficient spoken text for evaluation.",
-                "status_note": "Insufficient spoken text for evaluation.",
-                "is_clamped": True,
-                "word_count": words,
-                "char_count": chars,
-                "segment_count": segs
-            }
-        base = min(10, max(5, int(7 + (chars > 120) - (chars < 80))))
+    ensure_tmp_dirs()
+    wav_path = os.path.join(AUDIO_TMP_DIR, f"{uuid.uuid4().hex}_audio.wav")
+    try:
+        await asyncio.to_thread(extract_wav_with_ffmpeg, video_path, wav_path)
+        transcription = await transcribe_audio(
+            wav_path=wav_path,
+            host_name=host_name,
+            guest_name=guest_name,
+            groq_api_key=groq_key,
+        )
+        dialogue_script = transcription["dialogueScript"]
+        dialogue_turns = transcription["dialogueTurns"]
+        analytics = await analyze_with_gemini(
+            raw_transcript=dialogue_script,
+            dialogue_turns=dialogue_turns,
+            host_name=host_name,
+            guest_name=guest_name,
+            gemini_api_key=gemini_key,
+            segments=transcription.get("groqSegments") or dialogue_turns,
+        )
+        meeting_summary = await generate_groq_summary(dialogue_script, groq_key)
         return {
-            "communication_skills": min(10, base + 1),
-            "fluency": base,
-            "confidence": min(10, base + 1),
-            "awkwardness": max(1, 10 - base),
-            "straightforward_answers": base,
-            "rationale": "Grounded deterministic audit of spoken transcript turns.",
-            "status_note": "Validated against Groq transcript",
-            "is_clamped": False,
-            "word_count": words,
-            "char_count": chars,
-            "segment_count": segs
+            "transcription": transcription,
+            "analytics": analytics,
+            "dialogueScript": dialogue_script,
+            "dialogueTurns": dialogue_turns,
+            "summary": meeting_summary or analytics.get("summary", ""),
+            "wavPath": wav_path,
         }
-
-    speaker_ratings = {
-        host_name: score_or_insufficient(host_ling)
-    }
-
-    if guest_spoke and guest_name and guest_name.lower() != host_name.lower() and guest_ling.get("words", 0) > 0:
-        speaker_ratings[guest_name] = score_or_insufficient(guest_ling)
-
-    return {
-        "speakerRatings": speaker_ratings,
-        "factCheckAudit": questions_found,
-        "summary": f"Meeting for {host_name} processed.",
-        "gemini_model": "grounded-deterministic"
-    }
+    except Exception:
+        safe_unlink(wav_path)
+        raise
