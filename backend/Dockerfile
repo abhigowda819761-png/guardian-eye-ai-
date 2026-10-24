@@ -1,6 +1,10 @@
 FROM python:3.11-slim
 
-# Install system dependencies including FFmpeg for audio extraction
+# Prevent python from buffering stdout/stderr
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# Install system dependencies including FFmpeg for system-level 16kHz mono audio extraction loops
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     curl \
@@ -10,7 +14,8 @@ WORKDIR /app
 
 # Install Python requirements
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
 # Copy backend source code
 COPY . .
@@ -18,7 +23,8 @@ COPY . .
 # Create uploads directory for audio extraction outputs
 RUN mkdir -p uploads/audio
 
-ENV PORT=8000
-EXPOSE 8000
+# Set the runtime environment to explicitly bind to dynamic $PORT variable required by Render's routing mesh
+ENV PORT=10000
+EXPOSE 10000
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD exec uvicorn main:app --host 0.0.0.0 --port ${PORT:-10000}

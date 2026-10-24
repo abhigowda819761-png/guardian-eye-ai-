@@ -4,13 +4,30 @@
   "private": true,
   "description": "GuardianEye AI - AI-Powered Meeting Analysis Platform",
   "scripts": {
-    "dev": "npm run dev --prefix frontend",
+    "dev": "node backend/peer_server.js & npm run dev --prefix frontend",
     "dev:frontend": "npm run dev --prefix frontend",
     "backend": "./backend/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 --app-dir backend --reload",
+    "peer-server": "node backend/peer_server.js",
     "build": "npm run build --prefix frontend",
-    "lint": "npm run lint --prefix frontend"
+    "lint": "npm run lint --prefix frontend",
+    "android:sync": "npm run cap:sync --prefix frontend",
+    "android:build": "npm run cap:build --prefix frontend",
+    "android:open": "npm run cap:open --prefix frontend",
+    "deploy": "firebase deploy --only functions,firestore,storage",
+    "deploy:all": "firebase deploy",
+    "deploy:functions": "firebase deploy --only functions",
+    "deploy:firestore": "firebase deploy --only firestore",
+    "deploy:storage": "firebase deploy --only storage"
   },
   "keywords": [],
   "author": "",
-  "license": "ISC"
+  "license": "ISC",
+  "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^5.3.0",
+    "peer": "^1.0.2"
+  },
+  "devDependencies": {
+    "firebase-tools": "^15.34.1"
+  }
 }
