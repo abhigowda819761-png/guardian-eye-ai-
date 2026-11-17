@@ -27,6 +27,8 @@ class CategoryScores(BaseModel):
     active_listening_and_responsiveness: Optional[float] = Field(None, ge=0, le=100, description="Direct answering and acknowledging peers (Weight: 15%)")
     professional_communication: Optional[float] = Field(None, ge=0, le=100, description="Diplomacy, constructive tone, respect (Weight: 10%)")
     conciseness_and_structure: Optional[float] = Field(None, ge=0, le=100, description="Brevity and bottom-line up front (Weight: 10%)")
+    persuasive_assertiveness: Optional[float] = Field(None, ge=0, le=100, description="Rhetorical conviction, stance firmness & persuasive impact")
+    tone_style: Optional[str] = Field("Collaborative", description="Pragmatic intent & delivery posture: Commanding, Requesting, Polite, or Collaborative")
 
 class StrengthItem(BaseModel):
     title: str = Field(..., description="Concise label of the communication strength")
@@ -55,6 +57,8 @@ class CommunicationCoachingReport(BaseModel):
     assessment_type: str = Field("communication_coaching", description="Assessment type discriminator")
     metrics: SpeechMetrics
     category_scores: CategoryScores
+    persuasive_assertiveness: Optional[float] = Field(None, description="Persuasive assertiveness (1-10 or 0-100)")
+    tone_style: Optional[str] = Field("Collaborative", description="Delivery posture: Commanding, Requesting, Polite, Collaborative")
     overall_score: Optional[float] = Field(None, ge=0, le=100, description="Renormalized weighted average")
     strengths: List[StrengthItem] = Field(default_factory=list)
     improvement_areas: List[ImprovementAreaItem] = Field(default_factory=list)
@@ -473,7 +477,7 @@ def analyze_communication_coach(
         return fallback.model_dump()
 
     # Case 2: Attempt LLM inference if API key provided
-    resolved_api_key = api_key or os.environ.get("GEMINI_API_KEY")
+    resolved_api_key = api_key or os.environ.get("GEMINI_API_KEY_SECONDARY") or os.environ.get("GEMINI_API_KEY_PRIMARY") or os.environ.get("GEMINI_API_KEY")
     if resolved_api_key:
         try:
             import httpx
@@ -483,25 +487,29 @@ def analyze_communication_coach(
                 speech_statistics=speech_statistics,
                 meeting_context=meeting_context
             )
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={resolved_api_key}"
-            payload = {
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "temperature": 0.2,
-                    "responseMimeType": "application/json"
+            for model_id in ("gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-flash-latest", "gemini-3.8-flash"):
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={resolved_api_key}"
+                payload = {
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {
+                        "temperature": 0.2,
+                        "responseMimeType": "application/json"
+                    }
                 }
-            }
-            with httpx.Client(timeout=15.0) as client:
-                resp = client.post(url, json=payload)
-                if resp.status_code == 200:
-                    raw_text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-                    cleaned = raw_text.strip()
-                    if cleaned.startswith("```"):
-                        cleaned = re.sub(r"^```(?:json)?\n", "", cleaned)
-                        cleaned = re.sub(r"\n```$", "", cleaned)
-                    parsed = json.loads(cleaned)
-                    validated = CommunicationCoachingReport(**parsed)
-                    return validated.model_dump()
+                try:
+                    with httpx.Client(timeout=15.0) as client:
+                        resp = client.post(url, json=payload)
+                        if resp.status_code == 200:
+                            raw_text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+                            cleaned = raw_text.strip()
+                            if cleaned.startswith("```"):
+                                cleaned = re.sub(r"^```(?:json)?\n", "", cleaned)
+                                cleaned = re.sub(r"\n```$", "", cleaned)
+                            parsed = json.loads(cleaned)
+                            validated = CommunicationCoachingReport(**parsed)
+                            return validated.model_dump()
+                except Exception:
+                    continue
         except Exception:
             pass # Fallback to deterministic NLP engine
 
@@ -583,6 +591,20 @@ def analyze_communication_coach(
     concise_penalty = min(12.0, turn_penalty + (filler_density * 1.5))
     conciseness_and_structure = round(float(max(55.0, min(95.0, concise_base - concise_penalty))), 1)
 
+    # 8. Persuasive Assertiveness & Tone Style
+    assertive_markers = ["definitely", "clearly", "recommend", "ensure", "verified", "priority", "must", "decided", "will"]
+    assertive_count = sum(1 for am in assertive_markers if am in all_text.lower())
+    persuasive_assertiveness = round(float(max(40.0, min(96.0, 75.0 + min(15.0, assertive_count * 3.5) - (filler_density * 1.5)))), 1)
+
+    if any(q in all_text for q in ["?", "could you", "would you", "can we", "please share"]):
+        tone_style = "Requesting"
+    elif any(cmd in all_text.lower() for cmd in ["ensure", "must", "execute", "priority", "deploy", "action item"]):
+        tone_style = "Commanding"
+    elif any(pol in all_text.lower() for pol in ["thank", "appreciate", "pardon", "glad", "courtesy"]):
+        tone_style = "Polite"
+    else:
+        tone_style = "Collaborative"
+
     cat_scores = {
         "verbal_clarity": verbal_clarity,
         "speaking_fluency": speaking_fluency,
@@ -590,7 +612,9 @@ def analyze_communication_coach(
         "explanation_and_presentation": explanation_and_presentation,
         "active_listening_and_responsiveness": active_listening_and_responsiveness,
         "professional_communication": professional_communication,
-        "conciseness_and_structure": conciseness_and_structure
+        "conciseness_and_structure": conciseness_and_structure,
+        "persuasive_assertiveness": persuasive_assertiveness,
+        "tone_style": tone_style
     }
 
     overall_score = calculate_renormalized_overall_score(cat_scores)
@@ -697,6 +721,8 @@ def analyze_communication_coach(
             speaking_turn_count=turn_count
         ),
         category_scores=CategoryScores(**cat_scores),
+        persuasive_assertiveness=persuasive_assertiveness,
+        tone_style=tone_style,
         overall_score=overall_score,
         strengths=strengths,
         improvement_areas=improvement_areas,

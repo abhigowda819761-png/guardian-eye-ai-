@@ -18,7 +18,8 @@ export const RENDER_PRODUCTION_URL = 'https://guardian-eye-ai-backend.onrender.c
 // 3. Local desktop browser development check (Only true on desktop browser localhost, never in native APK)
 export const isLocalDesktop = typeof window !== 'undefined' && !isNativePlatform && (
   window.location.hostname === 'localhost' ||
-  window.location.hostname === '127.0.0.1'
+  window.location.hostname === '127.0.0.1' ||
+  window.location.hostname === '0.0.0.0'
 );
 export const isLocal = isLocalDesktop;
 
@@ -26,38 +27,41 @@ const envApiUrl = import.meta.env.VITE_API_URL;
 
 // 4. Global Cloud URL Resolution:
 // When launched from a native Android APK or mobile device, dynamically resolve to the live Render endpoint.
-// In desktop dev browser without VITE_API_URL, connect to local port 8000.
+// In desktop dev browser (Vite), use '' so requests route through Vite's dev proxy to port 8000.
 export const API_BASE_URL = (() => {
   if (isNativePlatform) {
     return envApiUrl && !envApiUrl.includes('localhost')
       ? envApiUrl.replace(/\/+$/, '')
       : RENDER_PRODUCTION_URL;
   }
+  if (isLocalDesktop) {
+    // If user explicitly provided a localhost URL in .env, honor it; otherwise default to '' for Vite proxy
+    if (envApiUrl && (envApiUrl.includes('localhost') || envApiUrl.includes('127.0.0.1'))) {
+      return envApiUrl.replace(/\/+$/, '');
+    }
+    return '';
+  }
   if (envApiUrl) {
     return envApiUrl.replace(/\/+$/, '');
   }
-  return isLocalDesktop
-    ? `http://${window.location.hostname}:8000`
-    : RENDER_PRODUCTION_URL;
+  return RENDER_PRODUCTION_URL;
 })();
 
 export const FALLBACK_API_URLS = [
-  API_BASE_URL,
-  RENDER_PRODUCTION_URL,
-  'https://guardian-eye-ai.onrender.com',
-  `http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:8000`,
+  '',
+  'http://127.0.0.1:8000',
   'http://localhost:8000',
-  'http://10.102.167.95:8000',
-  'http://127.0.0.1:8000'
-].filter((url, idx, arr) => url && arr.indexOf(url) === idx);
+  API_BASE_URL,
+  RENDER_PRODUCTION_URL
+].filter((url, idx, arr) => (url !== undefined && url !== null) && arr.indexOf(url) === idx);
 
 export const WS_BASE_URL = import.meta.env.VITE_WS_URL
   ? import.meta.env.VITE_WS_URL.replace(/\/+$/, '')
   : (isNativePlatform
       ? RENDER_PRODUCTION_URL.replace(/^http/, 'ws')
-      : (envApiUrl
-          ? envApiUrl.replace(/^http/, 'ws').replace(/\/+$/, '')
-          : (isLocalDesktop ? `ws://${window.location.hostname}:9000` : RENDER_PRODUCTION_URL.replace(/^http/, 'ws'))));
+      : (isLocalDesktop
+          ? `ws://${window.location.hostname}:9000`
+          : (envApiUrl ? envApiUrl.replace(/^http/, 'ws').replace(/\/+$/, '') : RENDER_PRODUCTION_URL.replace(/^http/, 'ws'))));
 
 // ── 1. Stable Public Google STUN + Auxiliary Firewall Traversal Array ─────────
 export const STUN_SERVERS = [

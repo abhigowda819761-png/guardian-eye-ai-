@@ -8,8 +8,12 @@ services:
     envVars:
       - key: PORT
         value: 10000
-      - key: GROQ_API_KEY
+      - key: GEMINI_API_KEY_PRIMARY
+        sync: false
+      - key: GEMINI_API_KEY_SECONDARY
         sync: false
       - key: GEMINI_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
         sync: false
 

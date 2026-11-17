@@ -21,7 +21,8 @@ import {
   CheckCircle2,
   Clock,
   ShieldCheck,
-  UploadCloud
+  UploadCloud,
+  Compass
 } from 'lucide-react';
 import jsPDF from 'jspdf';
 import html2canvas from 'html2canvas';
@@ -33,9 +34,11 @@ import {
   triggerAuditMeetingFactCheck,
   uploadMeetingVideoToFirebase,
   triggerGenerateMeetingTranscription,
+  analyzeVideoWithGroqAndGemini,
   auth,
   getCurrentAuthUser
 } from './firebase';
+import { downloadPresentationPdf } from './utils/exportPresentationPdf';
 import './MeetingDashboard.css';
 
 /**
@@ -62,6 +65,13 @@ const METRICS_CONFIG = [
     fillClass: 'fill-confidence',
     invert: false,
     desc: 'Tone assertiveness & executive presence'
+  },
+  {
+    key: 'persuasive_assertiveness',
+    label: 'Persuasive Assertiveness',
+    fillClass: 'fill-assertiveness',
+    invert: false,
+    desc: 'Rhetorical conviction, stance firmness & persuasive impact'
   },
   {
     key: 'awkwardness',
@@ -135,31 +145,62 @@ export default function MeetingDashboard({
   const [uploadStatus, setUploadStatus] = useState('');
   const fileInputRef = useRef(null);
 
-  // Sync when parent prop changes to a new non-default meeting ID
+  // Sync when parent prop changes to a new non-default meeting ID or when initialData arrives
   useEffect(() => {
     if (meetingId && meetingId !== 'meeting_default' && meetingId !== activeMeetingId) {
       setActiveMeetingId(String(meetingId));
-      // Absolute Cache Purge
-      setMeetingDoc({
-        meetingId: String(meetingId),
-        rawTranscript: null,
-        transcriptText: null,
-        dialogueTurns: [],
-        segments: [],
-        speakerRatings: null,
-        factCheckAudit: [],
-        summary: null,
-        meetingSummary: null,
-        transcriptionStatus: 'processing',
-        ratingsStatus: 'processing',
-        factCheckStatus: 'processing'
-      });
-      setTranscriptDoc({});
-      setCurrentStep(1);
-      setTranscriptionStatus('processing');
-      setLoading(true);
+      if (initialData && (initialData.dialogueTurns?.length > 0 || initialData.rawTranscript || initialData.speakerRatings)) {
+        setMeetingDoc(prev => ({
+          ...prev,
+          meetingId: String(meetingId),
+          ...initialData,
+          transcriptionStatus: initialData.transcriptionStatus || 'completed',
+          ratingsStatus: initialData.ratingsStatus || 'completed',
+          factCheckStatus: initialData.factCheckStatus || 'completed'
+        }));
+        setTranscriptDoc(initialData.transcriptDoc || initialData);
+        setTranscriptionStatus('completed');
+        setLoading(false);
+      } else {
+        // Absolute Cache Purge
+        setMeetingDoc({
+          meetingId: String(meetingId),
+          rawTranscript: null,
+          transcriptText: null,
+          dialogueTurns: [],
+          segments: [],
+          speakerRatings: null,
+          factCheckAudit: [],
+          summary: null,
+          meetingSummary: null,
+          transcriptionStatus: 'processing',
+          ratingsStatus: 'processing',
+          factCheckStatus: 'processing'
+        });
+        setTranscriptDoc({});
+        setCurrentStep(1);
+        setTranscriptionStatus('processing');
+        setLoading(true);
+      }
     }
-  }, [meetingId]);
+  }, [meetingId, activeMeetingId, initialData]);
+
+  // Keep state synced whenever initialData updates
+  useEffect(() => {
+    if (initialData && (initialData.dialogueTurns?.length > 0 || initialData.rawTranscript || initialData.speakerRatings)) {
+      setMeetingDoc(prev => ({
+        ...prev,
+        ...initialData,
+        meetingId: initialData.meetingId || activeMeetingId,
+        transcriptionStatus: initialData.transcriptionStatus || 'completed',
+        ratingsStatus: initialData.ratingsStatus || 'completed',
+        factCheckStatus: initialData.factCheckStatus || 'completed'
+      }));
+      setTranscriptDoc(initialData.transcriptDoc || initialData);
+      setTranscriptionStatus('completed');
+      setLoading(false);
+    }
+  }, [initialData, activeMeetingId]);
 
   // Dynamic Identity Injection:
   // Capture authenticated user identity at session moment and roster metadata
@@ -172,8 +213,8 @@ export default function MeetingDashboard({
       initialData?.hostName ||
       propHostName ||
       authUserName ||
-      'ABHIGOWDA819761';
-    return candidate && candidate !== 'Host' && candidate !== 'James' ? candidate : (authUserName || 'ABHIGOWDA819761');
+      'Host';
+    return (candidate && candidate.trim()) ? candidate.trim() : (authUserName || 'Host');
   }, [meetingDoc, initialData, propHostName, authUserName]);
 
   const guestName = useMemo(() => {
@@ -185,7 +226,7 @@ export default function MeetingDashboard({
       initialData?.guestName ||
       propGuestName ||
       'Participant';
-    return candidate && candidate !== 'Hassassin' && candidate !== 'Guest' ? candidate : 'Participant';
+    return (candidate && candidate.trim() && candidate !== 'Guest') ? candidate.trim() : 'Participant';
   }, [meetingDoc, initialData, propGuestName]);
 
   // 1. Real-time Firestore Listeners: Track meetings/{cleanMeetingId} & transcripts/{cleanMeetingId}
@@ -330,79 +371,60 @@ export default function MeetingDashboard({
     setIsUploadingVideo(true);
     setCurrentStep(1);
     setTranscriptionStatus('processing');
-    setUploadProgress(0);
-    setUploadStatus(`Step 1/4: Audio Extraction (16kHz mono)... (0%)`);
+    setUploadProgress(15);
+    setUploadStatus('Step 1/3: Extracting 16kHz audio from video file...');
 
-    const sessionHostIdentity = hostName || 'ABHIGOWDA819761';
-    const sessionGuestIdentity = guestName || 'Participant';
+    const sessionHostIdentity = (hostName && hostName.trim()) ? hostName.trim() : 'Host';
+    const sessionGuestIdentity = guestName || 'Participant 1';
 
     try {
-      const currentUser = getCurrentAuthUser() || auth?.currentUser;
-      const userId = currentUser?.uid || `user_${(hostName || 'host').toLowerCase()}`;
-
-      // Upload task targeting new dynamic ID
-      const uploadResult = await uploadMeetingVideoToFirebase(
-        file,
-        userId,
-        newSessionId,
-        (pct) => {
-          setUploadProgress(Math.min(pct, 95));
-          if (pct < 100) {
-            setUploadStatus(`Step 1/4: Audio Extraction (16kHz mono)... (${Math.round(pct)}%)`);
-          } else {
+      setUploadStatus('Step 2/3: Gemini 2.5 Flash Native Audio transcribing & diarizing...');
+      const backendRes = await analyzeVideoWithGroqAndGemini(file, {
+        meetingId: newSessionId,
+        hostName: sessionHostIdentity,
+        participantNames: [sessionGuestIdentity],
+        onProgress: (pct) => {
+          setUploadProgress(pct);
+          if (pct >= 90) {
+            setCurrentStep(3);
+            setUploadStatus('Step 3/3: Gemini 2.5 Flash scoring & fact-checking...');
+          } else if (pct >= 30) {
             setCurrentStep(2);
-            setUploadStatus('Step 2/4: Groq Whisper Large-V3 Diarization...');
+            setUploadStatus('Step 2/3: Gemini 2.5 Flash Native Audio transcribing & diarizing...');
           }
         }
-      );
+      });
 
-      if (uploadResult && uploadResult.storagePath) {
-        setCurrentStep(2);
-        setUploadStatus('Step 2/4: Groq Whisper Large-V3 Diarization & Transcription...');
-
-        const backendPayload = {
-          meetingId: newSessionId,
-          storagePath: uploadResult.storagePath,
-          hostName: sessionHostIdentity,
-          participantNames: [sessionGuestIdentity],
-          userId
-        };
-
-        setCurrentStep(3);
-        setUploadStatus('Step 3/4: Gemini 1.5 Flash Metric Scoring & Fact-Checking...');
-
-        const backendRes = await triggerGenerateMeetingTranscription(backendPayload);
-        if (backendRes) {
-          if (backendRes.success === false) {
-            setCurrentStep(1);
-            setIsUploadingVideo(false);
-            setLoading(false);
-            setTranscriptionStatus('failed');
-            setUploadStatus(`❌ Error: ${backendRes.error || 'Acoustic voice data could not be parsed from this video track.'}`);
-            return;
-          }
-
-          setCurrentStep(4);
-          setTranscriptionStatus('completed');
+      if (backendRes) {
+        if (backendRes.success === false) {
+          setCurrentStep(1);
           setIsUploadingVideo(false);
           setLoading(false);
-          setUploadProgress(100);
-          setMeetingDoc((prev) => ({
-            ...prev,
-            ...backendRes,
-            meetingId: newSessionId,
-            transcriptionStatus: 'completed',
-            ratingsStatus: 'completed',
-            factCheckStatus: 'completed'
-          }));
-          setTranscriptDoc((prev) => ({
-            ...prev,
-            ...backendRes,
-            meetingId: newSessionId,
-            status: 'completed'
-          }));
-          setUploadStatus('✅ Analysis completed: 100% media-driven verbatim pipeline.');
+          setTranscriptionStatus('failed');
+          setUploadStatus(`❌ Error: ${backendRes.error || backendRes.detail || 'Analysis could not be generated.'}`);
+          return;
         }
+
+        setCurrentStep(4);
+        setTranscriptionStatus('completed');
+        setIsUploadingVideo(false);
+        setLoading(false);
+        setUploadProgress(100);
+        setMeetingDoc((prev) => ({
+          ...prev,
+          ...backendRes,
+          meetingId: newSessionId,
+          transcriptionStatus: 'completed',
+          ratingsStatus: 'completed',
+          factCheckStatus: 'completed'
+        }));
+        setTranscriptDoc((prev) => ({
+          ...prev,
+          ...backendRes,
+          meetingId: newSessionId,
+          status: 'completed'
+        }));
+        setUploadStatus('✅ Analysis completed: 100% media-driven verbatim pipeline.');
       }
     } catch (err) {
       console.error('[MeetingDashboard] Upload error or network exception:', err);
@@ -503,15 +525,19 @@ export default function MeetingDashboard({
       for (const [spk, metrics] of Object.entries(source)) {
         if (metrics && typeof metrics === 'object') {
           parsed[spk] = {
-            communication_skills: Math.max(1, Math.min(10, Number(metrics.communication_skills) || 8)),
-            fluency: Math.max(1, Math.min(10, Number(metrics.fluency) || 7)),
-            confidence: Math.max(1, Math.min(10, Number(metrics.confidence) || 8)),
-            awkwardness: Math.max(1, Math.min(10, Number(metrics.awkwardness) || 2)),
-            straightforward_answers: Math.max(1, Math.min(10, Number(metrics.straightforward_answers) || 8)),
+            communication_skills: Math.max(1, Math.min(10, Number(metrics.communication_skills) || 5)),
+            fluency: Math.max(1, Math.min(10, Number(metrics.fluency) || 5)),
+            confidence: Math.max(1, Math.min(10, Number(metrics.confidence) || 5)),
+            awkwardness: Math.max(1, Math.min(10, Number(metrics.awkwardness) || 3)),
+            straightforward_answers: Math.max(1, Math.min(10, Number(metrics.straightforward_answers) || 5)),
+            persuasive_assertiveness: Math.max(1, Math.min(10, Number(metrics.persuasive_assertiveness) || Number(metrics.confidence) || 5)),
+            tone_style: metrics.tone_style ? String(metrics.tone_style).trim() : 'Collaborative',
             rationale: metrics.rationale,
-            word_count: metrics.word_count || 10,
-            char_count: metrics.char_count || 76,
-            segment_count: metrics.segment_count || 1,
+            wpm: metrics.wpm || 0,
+            filler_count: metrics.filler_count !== undefined ? metrics.filler_count : (metrics.fillers || 0),
+            word_count: metrics.word_count || 0,
+            char_count: metrics.char_count || 0,
+            segment_count: metrics.segment_count || 0,
             is_clamped: Boolean(metrics.is_clamped),
             status_note: metrics.status_note
           };
@@ -543,18 +569,12 @@ export default function MeetingDashboard({
   // Filter audit questions by selected user
   const filteredAudit = useMemo(() => {
     if (selectedAuditFilter === 'all') return factCheckAudit;
-    if (selectedAuditFilter === 'host') {
-      return factCheckAudit.filter(
-        (a) => a.question_by?.toLowerCase() === hostName.toLowerCase() || a.answered_by?.toLowerCase() === hostName.toLowerCase()
-      );
-    }
-    if (selectedAuditFilter === 'guest') {
-      return factCheckAudit.filter(
-        (a) => a.question_by?.toLowerCase() === guestName.toLowerCase() || a.answered_by?.toLowerCase() === guestName.toLowerCase()
-      );
-    }
-    return factCheckAudit;
-  }, [factCheckAudit, selectedAuditFilter, hostName, guestName]);
+    const filterLower = selectedAuditFilter.toLowerCase();
+    return factCheckAudit.filter(
+      (a) => (a.question_by && a.question_by.toLowerCase() === filterLower) ||
+             (a.answered_by && a.answered_by.toLowerCase() === filterLower)
+    );
+  }, [factCheckAudit, selectedAuditFilter]);
 
   // Calculate Fact Check Stats
   const auditStats = useMemo(() => {
@@ -577,7 +597,7 @@ export default function MeetingDashboard({
   // Re-run Fact-Checking Audit
   const handleTriggerAudit = async () => {
     setIsAuditing(true);
-    setAuditNotice('Invoking Gemini 1.5 Flash Fact-Check & Q&A Audit...');
+    setAuditNotice('Invoking Gemini 2.5 Flash Fact-Check & Q&A Audit...');
     try {
       const res = await triggerAuditMeetingFactCheck({
         meetingId: cleanMeetingId,
@@ -706,15 +726,15 @@ export default function MeetingDashboard({
     }
   };
 
-  // Helper to compute overall executive score out of 10
+  // Helper to compute overall executive score out of 10 with genuine unbiased weighting
   const computeOverallScore = (metrics) => {
-    if (!metrics) return 7.5;
-    const skills = metrics.communication_skills || 7;
-    const fluency = metrics.fluency || 7;
-    const confidence = metrics.confidence || 7;
-    const straight = metrics.straightforward_answers || 7;
-    const awkwardPenalty = (10 - (metrics.awkwardness || 3)) * 0.5;
-    const avg = (skills + fluency + confidence + straight + awkwardPenalty) / 4.5;
+    if (!metrics) return '5.0';
+    const skills = Number(metrics.communication_skills) || 5;
+    const fluency = Number(metrics.fluency) || 5;
+    const confidence = Number(metrics.confidence) || 5;
+    const straight = Number(metrics.straightforward_answers) || 5;
+    const poise = Math.max(1, 11 - (Number(metrics.awkwardness) || 3)); // 1 awk -> 10 poise, 10 awk -> 1 poise
+    const avg = (skills * 0.25) + (fluency * 0.25) + (confidence * 0.20) + (straight * 0.20) + (poise * 0.10);
     return Math.min(10, Math.max(1, Math.round(avg * 10) / 10)).toFixed(1);
   };
 
@@ -785,7 +805,7 @@ export default function MeetingDashboard({
               ) : (
                 <Clock size={16} />
               )}
-              <span>2. Groq Whisper Large-V3 Diarization</span>
+              <span>2. Gemini 2.5 Flash Native Diarization</span>
             </div>
 
             <div style={{ display: 'flex', alignItems: 'center', gap: '10px', fontSize: '0.82rem', color: currentStep >= 3 ? '#cbd5e1' : '#64748b' }}>
@@ -796,7 +816,7 @@ export default function MeetingDashboard({
               ) : (
                 <Clock size={16} />
               )}
-              <span>3. Gemini 1.5 Flash Metric Scoring</span>
+              <span>3. Gemini 2.5 Flash Metric Scoring</span>
             </div>
 
             <div style={{ display: 'flex', alignItems: 'center', gap: '10px', fontSize: '0.82rem', color: currentStep >= 4 ? '#cbd5e1' : '#64748b' }}>
@@ -880,7 +900,7 @@ export default function MeetingDashboard({
               <span className="dash-pill">ID: {cleanMeetingId}</span>
               <span className="dash-pill">
                 <Users size={12} />
-                {hostName} & {guestName}
+                {Object.keys(speakerRatings).length > 0 ? Object.keys(speakerRatings).join(', ') : `${hostName} & ${guestName}`}
               </span>
             </div>
           </div>
@@ -925,6 +945,17 @@ export default function MeetingDashboard({
             <FileText size={16} />
             <span>Download Codebase (.txt)</span>
           </a>
+
+          <button
+            type="button"
+            className="dash-action-btn secondary no-print"
+            onClick={() => downloadPresentationPdf()}
+            title="Download Presentation & Viva Master Q&A Guide (.pdf)"
+            style={{ display: 'inline-flex', alignItems: 'center', gap: '6px' }}
+          >
+            <Download size={16} />
+            <span>Download PPT Guide (.pdf)</span>
+          </button>
 
           <button
             type="button"
@@ -979,254 +1010,201 @@ export default function MeetingDashboard({
             </div>
             <span className="dash-pill">
               <Sparkles size={12} style={{ color: '#38bdf8' }} />
-              Gemini 1.5 Flash Evaluated (1–10 Scale)
+              Gemini 2.5 Flash Evaluated (1–10 Scale)
             </span>
           </div>
 
           <div
             className="ratings-grid"
             style={{
-              gridTemplateColumns: (() => {
-                const pKey = Object.keys(speakerRatings).find(
-                  (k) => k.toLowerCase() !== hostName.toLowerCase() && k !== 'Speaker 0' && !k.toLowerCase().includes('host')
-                );
-                const pMetrics = pKey ? speakerRatings[pKey] : (speakerRatings.Participant || (guestName && speakerRatings[guestName]));
-                const guestDidSpeak = Boolean(pMetrics && (pMetrics.word_count ?? 0) >= 10);
-                return guestDidSpeak ? 'repeat(auto-fit, minmax(320px, 1fr))' : 'minmax(320px, 680px)';
-              })()
+              gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))'
             }}
           >
-            {/* 1. Host Card (Always Displayed) */}
+            {/* Dynamic Speaker Cards for Up to 5 Participants (Host first, followed by active guests) */}
             {(() => {
+              // 1. Identify Host Key & Metrics
               const hostKey = Object.keys(speakerRatings || {}).find(
                 (k) => k.toLowerCase() === hostName.toLowerCase() ||
                        k === 'Speaker 0' ||
                        k === 'speaker_0' ||
-                       k.toLowerCase().includes('host') ||
-                       k.toLowerCase().includes('abhigowda')
-              ) || (speakerRatings?.['ABHIGOWDA819761'] ? 'ABHIGOWDA819761' : Object.keys(speakerRatings || {})[0]) || hostName;
+                       k.toLowerCase().includes('host')
+              ) || Object.keys(speakerRatings || {})[0] || hostName;
 
-              let hostMetrics = speakerRatings?.[hostKey] || speakerRatings?.[hostName] || speakerRatings?.['ABHIGOWDA819761'] || speakerRatings?.['speaker_0'] || speakerRatings?.['Speaker 0'] || speakerRatings?.['Host'] || Object.values(speakerRatings || {})[0];
+              const hostMetrics = speakerRatings?.[hostKey] || speakerRatings?.[hostName] || {
+                communication_skills: 5, fluency: 5, confidence: 5, awkwardness: 3, straightforward_answers: 5,
+                word_count: 0, char_count: 0, segment_count: 0, is_clamped: true
+              };
 
-              if (!hostMetrics) {
-                return (
-                  <div key="host-empty" className="speaker-rating-card host-card" style={{ padding: '36px 20px', textAlign: 'center', color: 'var(--dash-text-muted)' }}>
-                    <p style={{ margin: 0, fontSize: '0.92rem' }}>Awaiting audio transcription and speaker rating generation for {hostName}...</p>
-                  </div>
-                );
-              }
-              
-              const isInsufficient = Boolean(
-                hostMetrics.is_clamped && (hostMetrics.char_count !== undefined && hostMetrics.char_count < 15)
-              );
-              const overallScore = isInsufficient ? '1.0' : computeOverallScore(hostMetrics);
-
-              return (
-                <div key={hostKey} className="speaker-rating-card host-card">
-                  <div className="speaker-card-header">
-                    <div className="speaker-identity">
-                      <div className="speaker-avatar-circle">
-                        {hostName.charAt(0).toUpperCase()}
-                      </div>
-                      <div className="speaker-info">
-                        <h3>{hostName}</h3>
-                        <span className="speaker-role-tag">Host / Moderator</span>
-                      </div>
-                    </div>
-
-                    <div className="speaker-overall-badge">
-                      <span className="speaker-overall-score">{overallScore}</span>
-                      <span className="speaker-overall-label">{isInsufficient ? 'Clamped Score' : 'Executive Score'}</span>
-                    </div>
-                  </div>
-
-                  {/* Linguistic Telemetry */}
-                  <div className="telemetry-row">
-                    <span className="telemetry-pill telemetry-pill-verified">
-                      <ShieldCheck size={12} /> Groq Verified
-                    </span>
-                    {hostMetrics.word_count !== undefined && (
-                      <span className="telemetry-pill">{hostMetrics.word_count} Words</span>
-                    )}
-                    {hostMetrics.char_count !== undefined && (
-                      <span className="telemetry-pill">{hostMetrics.char_count} Chars</span>
-                    )}
-                  </div>
-
-                  {/* Anti-Hallucination Guardrail Check: Only render progress bars if validated */}
-                  {isInsufficient ? (
-                    <div className="speaker-guardrail-alert">
-                      <span className="speaker-guardrail-badge">
-                        <AlertTriangle size={14} /> Insufficient Spoken Text (&lt;50 chars)
-                      </span>
-                      <p className="speaker-guardrail-text">
-                        Anti-Hallucination Gate: Spoke fewer than 50 characters in the Groq transcript. Visual progress bars withheld to preserve 100% mathematical accuracy.
-                      </p>
-                      <div className="speaker-guardrail-footer">
-                        <span>Score safely clamped to 1.0/10</span>
-                        <span>Source: Groq Whisper V3</span>
-                      </div>
-                    </div>
-                  ) : (
-                    <>
-                      {/* Metric Bars: Strictly map keys present in payload */}
-                      <div className="metrics-list">
-                        {METRICS_CONFIG.filter((conf) => hostMetrics[conf.key] !== undefined && hostMetrics[conf.key] !== null).map((conf) => {
-                          const rawVal = hostMetrics[conf.key];
-                          const score = Math.max(1, Math.min(10, Number(rawVal) || 1));
-                          const percent = (score / 10) * 100;
-
-                          let statusClass = 'good';
-                          if (conf.invert) {
-                            statusClass = score <= 3 ? 'excellent' : score <= 6 ? 'good' : 'warning';
-                          } else {
-                            statusClass = score >= 8 ? 'excellent' : score >= 6 ? 'good' : 'warning';
-                          }
-
-                          return (
-                            <div key={conf.key} className="metric-row">
-                              <div className="metric-label-wrap">
-                                <span className="metric-name" title={conf.desc}>
-                                  {conf.label}
-                                </span>
-                                <span className={`metric-score-badge ${statusClass}`}>
-                                  {score}/10
-                                </span>
-                              </div>
-                              <div className="metric-bar-bg">
-                                <div
-                                  className={`metric-bar-fill ${conf.fillClass}`}
-                                  style={{ width: `${percent}%` }}
-                                />
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </div>
-                      {hostMetrics.rationale && (
-                        <div className="speaker-rationale-box">
-                          <strong>Linguistic Evidence:</strong> {hostMetrics.rationale}
-                        </div>
-                      )}
-                    </>
-                  )}
-                </div>
-              );
-            })()}
-
-            {/* 2. Participant Card: STRICT CONDITIONAL RENDERING */}
-            {/* If participant did not speak (< 10 words) or is absent from Firestore ratings, completely omitted */}
-            {(() => {
-              const participantKey = Object.keys(speakerRatings).find(
-                (k) => k.toLowerCase() !== hostName.toLowerCase() &&
-                       !k.toLowerCase().includes('abhigowda') &&
+              // 2. Identify all participant keys
+              const participantKeys = Object.keys(speakerRatings || {}).filter(
+                (k) => k !== hostKey &&
+                       k.toLowerCase() !== hostName.toLowerCase() &&
                        k !== 'Speaker 0' &&
+                       k !== 'speaker_0' &&
                        !k.toLowerCase().includes('host')
               );
-              const participantMetrics = participantKey ? speakerRatings[participantKey] : (speakerRatings.Participant || (guestName && speakerRatings[guestName]));
-              if (!participantMetrics) return null;
 
-              // Validation: if a participant has < 10 words in the transcript, completely hide their card
-              const wordCount = participantMetrics.word_count ?? 0;
-              if (wordCount < 10) return null;
+              // Build ordered list of active speakers: Host first, then guests (up to 5 total)
+              const cardList = [
+                {
+                  speakerName: hostName,
+                  isHost: true,
+                  metrics: hostMetrics,
+                  roleTag: 'Host / Moderator',
+                  avatarBg: 'linear-gradient(135deg, #0284c7, #38bdf8)'
+                }
+              ];
 
-              const participantDisplayName = participantKey || guestName || 'Participant';
-              const isInsufficient = Boolean(
-                participantMetrics.is_clamped && (participantMetrics.char_count !== undefined && participantMetrics.char_count < 15)
-              );
-              const overallScore = isInsufficient ? '1.0' : computeOverallScore(participantMetrics);
+              const avatarColors = [
+                'linear-gradient(135deg, #a855f7, #ec4899)',
+                'linear-gradient(135deg, #10b981, #06b6d4)',
+                'linear-gradient(135deg, #f59e0b, #ef4444)',
+                'linear-gradient(135deg, #6366f1, #8b5cf6)'
+              ];
 
-              return (
-                <div key={participantDisplayName} className="speaker-rating-card guest-card">
-                  <div className="speaker-card-header">
-                    <div className="speaker-identity">
-                      <div className="speaker-avatar-circle" style={{ background: 'linear-gradient(135deg, #a855f7, #ec4899)' }}>
-                        {participantDisplayName.charAt(0).toUpperCase()}
-                      </div>
-                      <div className="speaker-info">
-                        <h3>{participantDisplayName}</h3>
-                        <span className="speaker-role-tag">Participant / Guest</span>
-                      </div>
-                    </div>
+              participantKeys.forEach((pKey, idx) => {
+                const pMetrics = speakerRatings[pKey];
+                if (pMetrics) {
+                  cardList.push({
+                    speakerName: pKey,
+                    isHost: false,
+                    metrics: pMetrics,
+                    roleTag: `Participant ${idx + 1}`,
+                    avatarBg: avatarColors[idx % avatarColors.length]
+                  });
+                }
+              });
 
-                    <div className="speaker-overall-badge">
-                      <span className="speaker-overall-score">{overallScore}</span>
-                      <span className="speaker-overall-label">{isInsufficient ? 'Clamped Score' : 'Executive Score'}</span>
-                    </div>
-                  </div>
+              return cardList.map(({ speakerName, isHost, metrics, roleTag, avatarBg }) => {
+                const isInsufficient = Boolean(
+                  metrics.is_clamped && (
+                    (metrics.char_count !== undefined && metrics.char_count < 20) ||
+                    (metrics.word_count !== undefined && metrics.word_count < 4)
+                  )
+                );
+                const overallScore = isInsufficient ? '1.0' : computeOverallScore(metrics);
 
-                  {/* Linguistic Telemetry */}
-                  <div className="telemetry-row">
-                    <span className="telemetry-pill telemetry-pill-verified">
-                      <ShieldCheck size={12} /> Groq Verified
-                    </span>
-                    {participantMetrics.word_count !== undefined && (
-                      <span className="telemetry-pill">{participantMetrics.word_count} Words</span>
-                    )}
-                    {participantMetrics.char_count !== undefined && (
-                      <span className="telemetry-pill">{participantMetrics.char_count} Chars</span>
-                    )}
-                  </div>
-
-                  {/* Anti-Hallucination Guardrail Check: Only render progress bars if validated */}
-                  {isInsufficient ? (
-                    <div className="speaker-guardrail-alert">
-                      <span className="speaker-guardrail-badge">
-                        <AlertTriangle size={14} /> Insufficient Spoken Text (&lt;50 chars)
-                      </span>
-                      <p className="speaker-guardrail-text">
-                        Anti-Hallucination Gate: Spoke fewer than 50 characters in the Groq transcript. Visual progress bars withheld to preserve 100% mathematical accuracy.
-                      </p>
-                      <div className="speaker-guardrail-footer">
-                        <span>Score safely clamped to 1.0/10</span>
-                        <span>Source: Groq Whisper V3</span>
-                      </div>
-                    </div>
-                  ) : (
-                    <>
-                      {/* Metric Bars: Strictly map keys present in payload */}
-                      <div className="metrics-list">
-                        {METRICS_CONFIG.filter((conf) => participantMetrics[conf.key] !== undefined && participantMetrics[conf.key] !== null).map((conf) => {
-                          const rawVal = participantMetrics[conf.key];
-                          const score = Math.max(1, Math.min(10, Number(rawVal) || 1));
-                          const percent = (score / 10) * 100;
-
-                          let statusClass = 'good';
-                          if (conf.invert) {
-                            statusClass = score <= 3 ? 'excellent' : score <= 6 ? 'good' : 'warning';
-                          } else {
-                            statusClass = score >= 8 ? 'excellent' : score >= 6 ? 'good' : 'warning';
-                          }
-
-                          return (
-                            <div key={conf.key} className="metric-row">
-                              <div className="metric-label-wrap">
-                                <span className="metric-name" title={conf.desc}>
-                                  {conf.label}
-                                </span>
-                                <span className={`metric-score-badge ${statusClass}`}>
-                                  {score}/10
-                                </span>
-                              </div>
-                              <div className="metric-bar-bg">
-                                <div
-                                  className={`metric-bar-fill ${conf.fillClass}`}
-                                  style={{ width: `${percent}%` }}
-                                />
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </div>
-                      {participantMetrics.rationale && (
-                        <div className="speaker-rationale-box">
-                          <strong>Linguistic Evidence:</strong> {participantMetrics.rationale}
+                return (
+                  <div key={speakerName} className={`speaker-rating-card ${isHost ? 'host-card' : 'guest-card'}`}>
+                    <div className="speaker-card-header">
+                      <div className="speaker-identity">
+                        <div className="speaker-avatar-circle" style={{ background: avatarBg }}>
+                          {speakerName.charAt(0).toUpperCase()}
                         </div>
+                        <div className="speaker-info">
+                          <h3>{speakerName}</h3>
+                          <span className="speaker-role-tag">{roleTag}</span>
+                        </div>
+                      </div>
+
+                      <div className="speaker-overall-badge">
+                        <span className="speaker-overall-score">{overallScore}</span>
+                        <span className="speaker-overall-label">{isInsufficient ? 'Clamped Score' : 'Executive Score'}</span>
+                      </div>
+                    </div>
+
+                    {/* Linguistic Telemetry */}
+                    <div className="telemetry-row">
+                      <span className="telemetry-pill telemetry-pill-verified">
+                        <ShieldCheck size={12} /> Gemini Verified
+                      </span>
+                      {metrics.wpm ? (
+                        <span className="telemetry-pill">{metrics.wpm} WPM</span>
+                      ) : null}
+                      {metrics.filler_count !== undefined ? (
+                        <span className="telemetry-pill">{metrics.filler_count} Fillers</span>
+                      ) : null}
+                      {metrics.word_count !== undefined && (
+                        <span className="telemetry-pill">{metrics.word_count} Words</span>
                       )}
-                    </>
-                  )}
-                </div>
-              );
+                      {metrics.tone_style ? (
+                        <span className={`telemetry-pill telemetry-pill-tone tone-${String(metrics.tone_style).toLowerCase()}`}>
+                          <Compass size={12} /> Tone: {metrics.tone_style}
+                        </span>
+                      ) : null}
+                    </div>
+
+                    {/* Anti-Hallucination Guardrail Check */}
+                    {isInsufficient ? (
+                      <div className="speaker-guardrail-alert">
+                        <span className="speaker-guardrail-badge">
+                          <AlertTriangle size={14} /> Insufficient Spoken Text (&lt;20 chars / &lt;4 words)
+                        </span>
+                        <p className="speaker-guardrail-text">
+                          Anti-Hallucination Gate: Spoke fewer than 4 words or 20 characters in the Gemini transcript. Visual progress bars withheld to preserve mathematical accuracy.
+                        </p>
+                        <div className="speaker-guardrail-footer">
+                          <span>Score safely clamped to 1.0/10</span>
+                          <span>Source: Gemini 2.5 Flash</span>
+                        </div>
+                      </div>
+                    ) : (
+                      <>
+                        <div className="metrics-list">
+                          {METRICS_CONFIG.filter((conf) => metrics[conf.key] !== undefined && metrics[conf.key] !== null).map((conf) => {
+                            const rawVal = metrics[conf.key];
+                            const score = Math.max(1, Math.min(10, Number(rawVal) || 1));
+                            const percent = (score / 10) * 100;
+
+                            let statusClass = 'good';
+                            if (conf.invert) {
+                              statusClass = score <= 3 ? 'excellent' : score <= 6 ? 'good' : 'warning';
+                            } else {
+                              statusClass = score >= 8 ? 'excellent' : score >= 6 ? 'good' : 'warning';
+                            }
+
+                            return (
+                              <div key={conf.key} className="metric-row">
+                                <div className="metric-label-wrap">
+                                  <span className="metric-name" title={conf.desc}>
+                                    {conf.label}
+                                  </span>
+                                  <span className={`metric-score-badge ${statusClass}`}>
+                                    {score}/10
+                                  </span>
+                                </div>
+                                <div className="metric-bar-bg">
+                                  <div
+                                    className={`metric-bar-fill ${conf.fillClass}`}
+                                    style={{ width: `${percent}%` }}
+                                  />
+                                </div>
+                              </div>
+                            );
+                          })}
+
+                          {/* Tone Style & Delivery Vector Metric Bar */}
+                          <div className="metric-row tone-style-metric-row">
+                            <div className="metric-label-wrap">
+                              <span className="metric-name" title="Pragmatic intent & communicative delivery posture (Commanding / Requesting / Polite / Collaborative)">
+                                Tone Style & Delivery Vector
+                              </span>
+                              <span className={`metric-tone-badge tone-${String(metrics.tone_style || 'collaborative').toLowerCase()}`}>
+                                {metrics.tone_style || 'Collaborative'}
+                              </span>
+                            </div>
+                            <div className="metric-bar-bg tone-bar-bg">
+                              <div
+                                className={`metric-bar-fill fill-tone-vector tone-${String(metrics.tone_style || 'collaborative').toLowerCase()}`}
+                                style={{
+                                  width: String(metrics.tone_style || '').toLowerCase().includes('command') ? '92%' :
+                                         String(metrics.tone_style || '').toLowerCase().includes('request') ? '78%' :
+                                         String(metrics.tone_style || '').toLowerCase().includes('polit') ? '82%' : '86%'
+                                }}
+                              />
+                            </div>
+                          </div>
+                        </div>
+                        {metrics.rationale && (
+                          <div className="speaker-rationale-box">
+                            <strong>Linguistic Evidence:</strong> {metrics.rationale}
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </div>
+                );
+              });
             })()}
           </div>
         </section>
@@ -1313,7 +1291,7 @@ export default function MeetingDashboard({
                 <div>
                   <h2 className="dash-section-title">Fact-Checking & Q&A Audit</h2>
                   <p style={{ margin: '2px 0 0 0', fontSize: '0.75rem', color: 'var(--dash-text-muted)' }}>
-                    Powered by Google Gemini 1.5 Flash • Evaluates question intent, verbatim raw answers & AI accuracy verdicts
+                    Powered by Google Gemini 2.5 Flash • Evaluates question intent, verbatim raw answers & AI accuracy verdicts
                   </p>
                 </div>
               </div>
@@ -1329,28 +1307,26 @@ export default function MeetingDashboard({
                   </button>
                   <button
                     type="button"
-                    className={`fact-tab-btn ${selectedAuditFilter === 'host' ? 'active' : ''}`}
-                    onClick={() => setSelectedAuditFilter('host')}
+                    className={`fact-tab-btn ${selectedAuditFilter.toLowerCase() === hostName.toLowerCase() ? 'active' : ''}`}
+                    onClick={() => setSelectedAuditFilter(hostName)}
                   >
                     {hostName}
                   </button>
-                  {(() => {
-                    const pKey = Object.keys(speakerRatings).find(
-                      (k) => k.toLowerCase() !== hostName.toLowerCase() && k !== 'Speaker 0' && !k.toLowerCase().includes('host')
-                    );
-                    const pMetrics = pKey ? speakerRatings[pKey] : (speakerRatings.Participant || (guestName && speakerRatings[guestName]));
-                    const guestDidSpeak = Boolean(pMetrics && (pMetrics.word_count ?? 0) >= 10);
-                    if (!guestDidSpeak) return null;
-                    return (
-                      <button
-                        type="button"
-                        className={`fact-tab-btn ${selectedAuditFilter === 'guest' ? 'active' : ''}`}
-                        onClick={() => setSelectedAuditFilter('guest')}
-                      >
-                        {guestName || 'Participant'}
-                      </button>
-                    );
-                  })()}
+                  {Object.keys(speakerRatings || {}).filter(
+                    (k) => k.toLowerCase() !== hostName.toLowerCase() &&
+                           k !== 'Speaker 0' &&
+                           k !== 'speaker_0' &&
+                           !k.toLowerCase().includes('host')
+                  ).map((pKey) => (
+                    <button
+                      key={pKey}
+                      type="button"
+                      className={`fact-tab-btn ${selectedAuditFilter.toLowerCase() === pKey.toLowerCase() ? 'active' : ''}`}
+                      onClick={() => setSelectedAuditFilter(pKey)}
+                    >
+                      {pKey}
+                    </button>
+                  ))}
                 </div>
 
                 <button
@@ -1358,7 +1334,7 @@ export default function MeetingDashboard({
                   className="dash-action-btn secondary no-print"
                   onClick={handleTriggerAudit}
                   disabled={isAuditing}
-                  title="Re-run fact checking audit with Gemini 1.5 Flash"
+                  title="Re-run fact checking audit with Gemini 2.5 Flash"
                   style={{ padding: '6px 12px', fontSize: '0.78rem' }}
                 >
                   <RefreshCw size={13} className={isAuditing ? 'spin' : ''} />

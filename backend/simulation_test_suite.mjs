@@ -28,8 +28,8 @@ async function testSignalingLifecycle() {
   const createPayload = {
     action: 'create',
     code: TEST_ROOM_CODE,
-    hostPeerId: 'ge-host-TEST_ROOM_99-abhishek',
-    hostName: 'Abhishek',
+    hostPeerId: 'ge-host-TEST_ROOM_99-host',
+    hostName: 'Host',
     topic: 'Video Connectivity & Codec Stress Test'
   };
 
@@ -43,7 +43,7 @@ async function testSignalingLifecycle() {
     throw new Error(`Failed to create room: HTTP ${createRes.status}`);
   }
   const createData = await createRes.json();
-  console.log(`  ✓ Host 'Abhishek' created room '${TEST_ROOM_CODE}'. Response:`, createData.status);
+  console.log(`  ✓ Host 'Host' created room '${TEST_ROOM_CODE}'. Response:`, createData.status);
 
   // B. Participant 1 fetches room details
   const getRes = await fetch(`${LIVE_BACKEND_URL}/api/rooms/${TEST_ROOM_CODE}`);
@@ -276,10 +276,10 @@ function testSpeechScriptCompilation() {
 
   const startTime = Date.now();
 
-  // Mock input 1: Host Abhishek speaks at t0
+  // Mock input 1: Host speaks at t0
   const hostChunk = {
-    speakerId: 'ge-host-TEST_ROOM_99-abhishek',
-    speakerName: 'Abhishek',
+    speakerId: 'ge-host-TEST_ROOM_99-host',
+    speakerName: 'Host',
     isHost: true,
     text: "Hi everyone, let's test the video connectivity.",
     timestamp: startTime
@@ -354,7 +354,7 @@ function testSpeechScriptCompilation() {
   results.generatedScript = finalScript;
 
   // Validation
-  if (!finalScript.includes("Host (Abhishek): Hi everyone, let's test the video connectivity.")) {
+  if (!finalScript.includes("Host (Host): Hi everyone, let's test the video connectivity.")) {
     throw new Error('Host transcript missing or incorrectly labeled in script.');
   }
   if (!finalScript.includes("Participant 1 (Alok Kumar): The video sync is seamless, zero lag!")) {

@@ -296,7 +296,8 @@ def cluster_speakers(
         closest_cluster = int(np.argmin(dists))
 
         # Distance threshold: if voice is distinct enough and we haven't reached max_speakers
-        if min_dist > 3.0 and len(cluster_centers) < max_speakers:
+        # 1.55 allows distinct natural human voices to separate cleanly without collapsing
+        if min_dist > 1.55 and len(cluster_centers) < max_speakers:
             cluster_centers.append(X_norm[i])
             labels[i] = int(len(cluster_centers) - 1)
         else:
@@ -352,42 +353,152 @@ def create_speaker_consolidated_wav(src_wav: str, dest_wav: str, intervals: List
         w.setframerate(framerate)
         w.writeframes(bytes(combined_frames))
 
-def transcribe_master_with_groq(wav_path: str) -> List[Dict[str, Any]]:
+def get_gemini_api_keys() -> Tuple[str, str]:
+    """Resolves primary and secondary GEMINI_API_KEY from environment with load-splitting support."""
+    def _clean(k: Optional[str]) -> str:
+        s = (k or "").strip()
+        if s in (
+            "AIzaSy_YOUR_FIRST_GEMINI_API_KEY_HERE",
+            "AIzaSy_YOUR_SECOND_GEMINI_API_KEY_HERE",
+            "YOUR_GEMINI_API_KEY_HERE",
+            "YOUR_GROQ_API_KEY_HERE"
+        ):
+            return ""
+        return s
+
+    primary = _clean(os.getenv("GEMINI_API_KEY_PRIMARY")) or _clean(os.getenv("GEMINI_API_KEY"))
+    secondary = _clean(os.getenv("GEMINI_API_KEY_SECONDARY"))
+
+    groq_val = _clean(os.getenv("GROQ_API_KEY"))
+    if groq_val and (groq_val.startswith("AIza") or groq_val.startswith("AQ.")):
+        if not primary: primary = groq_val
+        elif not secondary: secondary = groq_val
+
+    if not secondary: secondary = primary
+    if not primary: primary = secondary
+
+    return primary, secondary
+
+def get_gemini_api_key(role: str = "primary") -> str:
+    """Resolves single GEMINI_API_KEY based on role ('primary' or 'secondary')."""
+    p, s = get_gemini_api_keys()
+    return p if role == "primary" else s
+
+def _prepare_gemini_audio(wav_path: str) -> Tuple[str, str]:
+    """Compresses WAV to compact 16kHz mono 48kbps MP3 for fast lightweight inline_data."""
+    mp3_path = wav_path.rsplit(".", 1)[0] + "_gemini.mp3"
+    ffmpeg_bin = get_ffmpeg_binary()
+    cmd = [
+        ffmpeg_bin, "-y",
+        "-i", wav_path,
+        "-vn",
+        "-ar", "16000",
+        "-ac", "1",
+        "-b:a", "48k",
+        mp3_path
+    ]
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+        if res.returncode == 0 and os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 100:
+            return mp3_path, "audio/mp3"
+    except Exception as e:
+        print(f"[audio_extractor] MP3 compression notice: {e}")
+    return wav_path, "audio/wav"
+
+def transcribe_master_with_gemini(wav_path: str) -> List[Dict[str, Any]]:
     """
-    Rapidly transcribes the master WAV file using Groq Whisper Large-V3 in a single API call.
-    Zero local CPU/RAM overhead; prevents Render 512MB free tier OOM crashes.
+    Rapidly transcribes the master WAV file using Google Gemini 2.5 Flash Native Multimodal Audio (inline_data).
+    Zero local CPU/RAM overhead; prevents Render 512MB free tier OOM crashes and removes Groq API dependencies.
     """
-    groq_key = os.environ.get("GROQ_API_KEY", "").strip()
-    if not groq_key or not os.path.exists(wav_path) or os.path.getsize(wav_path) < 1000:
+    primary_key, secondary_key = get_gemini_api_keys()
+    keys_to_try = [primary_key]
+    if secondary_key and secondary_key != primary_key:
+        keys_to_try.append(secondary_key)
+
+    if not keys_to_try or not os.path.exists(wav_path) or os.path.getsize(wav_path) < 1000:
         return []
 
+    upload_path, mime_type = _prepare_gemini_audio(wav_path)
     try:
+        import base64
+        import json
+        import re
         import httpx
-        with open(wav_path, "rb") as f:
-            files = {"file": (os.path.basename(wav_path), f, "audio/wav")}
-            data = {
-                "model": "whisper-large-v3",
-                "response_format": "verbose_json",
-                "temperature": "0.0"
+
+        with open(upload_path, "rb") as f:
+            audio_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+        prompt = """You are an expert audio transcription engine for 'Guardian Eye AI'.
+Transcribe the attached meeting/interview audio recording verbatim into chronological segments with accurate start and end timestamps in seconds.
+Preserve all natural speech and filler words ("um", "uh", "like", "you know") for accurate fluency auditing.
+
+Return ONLY valid JSON matching this exact schema:
+{
+  "segments": [
+    {
+      "start": 0.0,
+      "end": 3.5,
+      "text": "Verbatim words spoken in this segment."
+    }
+  ]
+}"""
+
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"inline_data": {"mime_type": mime_type, "data": audio_b64}},
+                    {"text": prompt}
+                ]
+            }],
+            "generationConfig": {
+                "temperature": 0.0,
+                "responseMimeType": "application/json"
             }
-            headers = {"Authorization": f"Bearer {groq_key}"}
-            with httpx.Client(timeout=45.0) as client:
-                resp = client.post(
-                    "https://api.groq.com/openai/v1/audio/transcriptions",
-                    files=files,
-                    data=data,
-                    headers=headers
-                )
-                if resp.status_code == 200:
-                    payload = resp.json()
-                    segments = payload.get("segments", [])
-                    print(f"[audio_extractor] Groq transcribed master WAV into {len(segments)} segments.")
-                    return segments
-                else:
-                    print(f"[audio_extractor] Groq API returned status {resp.status_code}: {resp.text[:120]}")
+        }
+
+        # Cascade through active Gemini Flash models
+        models_to_try = (
+            "gemini-3.5-flash",
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-flash-lite",
+            "gemini-flash-latest",
+            "gemini-3.8-flash"
+        )
+
+        with httpx.Client(timeout=120.0) as client:
+            for key_candidate in keys_to_try:
+                for model_id in models_to_try:
+                    try:
+                        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={key_candidate}"
+                        resp = client.post(url, json=payload)
+                        if resp.status_code == 200:
+                            resp_json = resp.json()
+                            candidates = resp_json.get("candidates", [])
+                            if candidates:
+                                text_content = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                                clean_json = re.sub(r"^```(?:json)?\s*", "", text_content.strip(), flags=re.MULTILINE)
+                                clean_json = re.sub(r"```$", "", clean_json.strip(), flags=re.MULTILINE)
+                                parsed = json.loads(clean_json)
+                                segs = parsed.get("segments", []) if isinstance(parsed, dict) else (parsed if isinstance(parsed, list) else [])
+                                if segs:
+                                    print(f"[audio_extractor] Gemini ({model_id}) transcribed master audio into {len(segs)} segments.")
+                                    return segs
+                        else:
+                            print(f"[audio_extractor] Gemini {model_id} returned HTTP {resp.status_code}: {resp.text[:120]}")
+                    except Exception as m_err:
+                        print(f"[audio_extractor] Gemini {model_id} notice: {m_err}")
     except Exception as e:
-        print(f"[audio_extractor] Groq transcription notice: {e}")
+        print(f"[audio_extractor] Gemini transcription exception: {e}")
+    finally:
+        if upload_path != wav_path and os.path.exists(upload_path):
+            try:
+                os.remove(upload_path)
+            except Exception:
+                pass
     return []
+
+# Backward-compatibility alias
+transcribe_master_with_groq = transcribe_master_with_gemini
 
 def process_video_diarization(
     video_path: str,
@@ -496,14 +607,7 @@ def process_video_diarization(
                 pass
 
         if not turn_text:
-            context_dialogues = [
-                f"Reviewing our key milestones and aligning on the deliverables for this release.",
-                f"From my side, all functional modules and test suites are executing with high stability.",
-                f"Let me add some context regarding the timeline and performance metrics.",
-                f"Agreed. We should ensure the team is aligned on the deployment checklist.",
-                f"Thanks everyone, the action items are captured and ready for implementation."
-            ]
-            turn_text = context_dialogues[idx % len(context_dialogues)]
+            continue
 
         turn_item = {
             "turnIndex": idx + 1,

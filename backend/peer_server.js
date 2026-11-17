@@ -27,9 +27,7 @@ app.get('/health', (req, res) => {
 });
 
 // In-memory User Registry (retained across warm serverless function invocations)
-const users = global.__guardianeye_users || (global.__guardianeye_users = new Map([
-  ['abhi@gmail.com', { password: 'Abhi@123', displayName: 'Abhishek', role: 'host' }]
-]));
+const users = global.__guardianeye_users || (global.__guardianeye_users = new Map());
 
 // Auth: Login Endpoint
 app.post('/api/auth/login', (req, res) => {

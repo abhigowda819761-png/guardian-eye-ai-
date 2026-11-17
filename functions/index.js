@@ -486,9 +486,9 @@ async function generateGroqMeetingSummary(rawTranscript, groqKey) {
 
 /**
  * Format Groq OpenAI Whisper Large-V3 output into chronological movie-script style dialogue.
- * Dynamically binds Speaker 0 and Speaker 1 strictly to runtime injected identities (e.g. ABHIGOWDA819761).
+ * Dynamically binds Speaker 0 and Speaker 1 strictly to runtime injected identities (e.g. Host).
  */
-function formatWhisperDialogue(groqData, hostName = "ABHIGOWDA819761", guestName = "Participant") {
+function formatWhisperDialogue(groqData, hostName = "Host", guestName = "Participant") {
   const segments = groqData?.segments;
 
   if (Array.isArray(segments) && segments.length > 0) {
@@ -677,7 +677,7 @@ exports.generateMeetingTranscription = onCall(
       console.warn("[generateMeetingTranscription] Meeting metadata notice:", metaErr.message);
     }
 
-    if (!hostName) hostName = "ABHIGOWDA819761";
+    if (!hostName || !hostName.trim()) hostName = "Host";
     if (!guestName) guestName = "Participant";
 
     // Update status to processing in Firestore
@@ -1142,6 +1142,8 @@ function sanitizeCombinedAnalytics(
         confidence: 1,
         awkwardness: 1,
         straightforward_answers: 1,
+        persuasive_assertiveness: 1,
+        tone_style: "Polite",
         rationale: "Insufficient spoken text for evaluation.",
         status_note: "Insufficient spoken text for evaluation.",
         is_clamped: true,
@@ -1151,14 +1153,22 @@ function sanitizeCombinedAnalytics(
       };
     }
 
+    const persuasive = clamp(speakerData.persuasive_assertiveness || conf);
+    const rawTone = String(speakerData.tone_style || "").toLowerCase();
+    const toneStyle = rawTone.includes("command") ? "Commanding" :
+                      rawTone.includes("request") ? "Requesting" :
+                      rawTone.includes("polit") ? "Polite" : "Collaborative";
+
     return {
       communication_skills: comm,
       fluency: flu,
       confidence: conf,
       awkwardness: awk,
       straightforward_answers: straight,
-      rationale: speakerData.rationale || "Verified against Groq transcription evidence.",
-      status_note: "Validated against Groq transcript",
+      persuasive_assertiveness: persuasive,
+      tone_style: toneStyle,
+      rationale: speakerData.rationale || "Verified against transcription evidence.",
+      status_note: "Validated against transcript",
       is_clamped: false,
       word_count: words,
       char_count: chars,
@@ -1352,6 +1362,8 @@ function sanitizeRatingsSchema(data, hostName = "Host", guestName = "Participant
         confidence: 1,
         awkwardness: 1,
         straightforward_answers: 1,
+        persuasive_assertiveness: 1,
+        tone_style: "Polite",
         rationale: "Insufficient spoken text for evaluation.",
         status_note: "Insufficient spoken text for evaluation.",
         is_clamped: true,
@@ -1360,14 +1372,22 @@ function sanitizeRatingsSchema(data, hostName = "Host", guestName = "Participant
       };
     }
 
+    const confScore = clamp(speakerData.confidence);
+    const rawTone = String(speakerData.tone_style || "").toLowerCase();
+    const toneStyle = rawTone.includes("command") ? "Commanding" :
+                      rawTone.includes("request") ? "Requesting" :
+                      rawTone.includes("polit") ? "Polite" : "Collaborative";
+
     return {
       communication_skills: clamp(speakerData.communication_skills),
       fluency: clamp(speakerData.fluency),
-      confidence: clamp(speakerData.confidence),
+      confidence: confScore,
       awkwardness: clamp(speakerData.awkwardness),
       straightforward_answers: clamp(speakerData.straightforward_answers),
-      rationale: speakerData.rationale || "Verified against Groq transcription evidence.",
-      status_note: "Validated against Groq transcript",
+      persuasive_assertiveness: clamp(speakerData.persuasive_assertiveness || confScore),
+      tone_style: toneStyle,
+      rationale: speakerData.rationale || "Verified against transcription evidence.",
+      status_note: "Validated against transcript",
       is_clamped: false,
       word_count: words,
       char_count: chars
@@ -1435,7 +1455,8 @@ exports.analyzeMeetingRatings = onCall(
     const meetingData = meetingSnap.exists ? meetingSnap.data() : {};
     const rawTranscript = data.rawTranscript || meetingData.rawTranscript;
 
-    let hostName = data.hostName || meetingData.hostName || "ABHIGOWDA819761";
+    let hostName = (data.hostName || meetingData.hostName || "Host").trim();
+    if (!hostName) hostName = "Host";
     let guestName = (Array.isArray(data.participantNames) && data.participantNames[0]) ||
       (meetingData.participants && (meetingData.participants[0]?.name || meetingData.participants[0])) ||
       (meetingData.participantNames && meetingData.participantNames[0]) ||
@@ -1616,7 +1637,8 @@ exports.auditMeetingFactCheck = onCall(
     const meetingData = meetingSnap.exists ? meetingSnap.data() : {};
     const rawTranscript = data.rawTranscript || meetingData.rawTranscript;
 
-    let hostName = data.hostName || meetingData.hostName || "ABHIGOWDA819761";
+    let hostName = (data.hostName || meetingData.hostName || "Host").trim();
+    if (!hostName) hostName = "Host";
     let guestName = (Array.isArray(data.participantNames) && data.participantNames[0]) ||
       (meetingData.participants && (meetingData.participants[0]?.name || meetingData.participants[0])) ||
       (meetingData.participantNames && meetingData.participantNames[0]) ||

@@ -23,8 +23,10 @@ import {
   X,
   Eye,
   EyeOff,
-  Activity
+  Activity,
+  FileText
 } from 'lucide-react';
+import { downloadPresentationPdf } from './utils/exportPresentationPdf';
 import logoImg from './assets/logo.png';
 import MeetingRoom from './MeetingRoom';
 import ErrorBoundary from './ErrorBoundary';
@@ -63,7 +65,12 @@ function App() {
 
   // User States
   const [hostName, setHostName] = useState(() => {
-    return localStorage.getItem('hostName') || '';
+    const saved = (localStorage.getItem('hostName') || '').trim();
+    if (['ABHIGOWDA819761', 'ABHISHEK', 'NAANUU112233', 'JAMES', 'HASSASSIN'].includes(saved.toUpperCase())) {
+      localStorage.removeItem('hostName');
+      return '';
+    }
+    return saved;
   });
   const [usernameInput, setUsernameInput] = useState('');
   const [passwordInput, setPasswordInput] = useState('');
@@ -290,18 +297,21 @@ function App() {
     }
 
     try {
+      const customName = displayNameInput.trim();
       if (isRegisterMode) {
-        const user = await registerUser(cleanEmail, inputPass, displayNameInput.trim());
+        const user = await registerUser(cleanEmail, inputPass, customName);
         setAuthSuccessMsg("Account created and secured with Firebase! Redirecting...");
         setTimeout(() => {
-          setHostName(user.displayName);
-          localStorage.setItem('hostName', user.displayName);
+          const resolvedName = customName || user.displayName || cleanEmail.split('@')[0];
+          setHostName(resolvedName);
+          localStorage.setItem('hostName', resolvedName);
           setPhase('dashboard');
         }, 500);
       } else {
-        const user = await loginUser(cleanEmail, inputPass);
-        setHostName(user.displayName);
-        localStorage.setItem('hostName', user.displayName);
+        const user = await loginUser(cleanEmail, inputPass, customName);
+        const resolvedName = customName || user.displayName || cleanEmail.split('@')[0];
+        setHostName(resolvedName);
+        localStorage.setItem('hostName', resolvedName);
         setPhase('dashboard');
       }
     } catch (err) {
@@ -450,10 +460,11 @@ function App() {
   // Unified dual-engine audio extraction & speaker diarization
   const executeAudioExtraction = async ({ file, host, participants, onProgress }) => {
     const candidateEndpoints = [
-      `${API_BASE_URL}/api/video/extract-audio`,
+      '/api/video/extract-audio',
+      `${API_BASE_URL ? API_BASE_URL.replace(/\/+$/, '') : ''}/api/video/extract-audio`,
+      'http://127.0.0.1:8000/api/video/extract-audio',
       `http://${window.location.hostname}:8000/api/video/extract-audio`,
-      'http://localhost:8000/api/video/extract-audio',
-      'http://127.0.0.1:8000/api/video/extract-audio'
+      'http://localhost:8000/api/video/extract-audio'
     ].filter((u, i, a) => u && a.indexOf(u) === i);
 
     for (const endpoint of candidateEndpoints) {
@@ -466,7 +477,7 @@ function App() {
         const data = await new Promise((resolve, reject) => {
           const xhr = new XMLHttpRequest();
           xhr.open('POST', endpoint, true);
-          xhr.timeout = 3000;
+          xhr.timeout = 120000; // 120 seconds timeout for high-capacity audio extraction
 
           xhr.upload.onprogress = (evt) => {
             if (evt.lengthComputable && onProgress) {
@@ -524,15 +535,45 @@ function App() {
     setUploadStatusText('Initializing GuardianEye AI audio extraction engine...');
 
     try {
-      const audioResult = await executeAudioExtraction({
-        file: uploadFile,
-        host: uploadHostName.trim() || hostName || 'Host',
-        participants: uploadParticipants.trim(),
-        onProgress: (pct, msg) => {
+      const host = uploadHostName.trim() || hostName || 'Host';
+      const participants = uploadParticipants.trim();
+      const participantList = participants ? participants.split(',').map(s => s.trim()).filter(Boolean) : ['Participant'];
+
+      // Route directly through 100% native Gemini 2.5 Flash pipeline
+      const pipelineResult = await analyzeVideoWithGroqAndGemini(uploadFile, {
+        meetingId: `meeting_${Date.now()}`,
+        hostName: host,
+        participantNames: participantList,
+        onProgress: (pct) => {
           setUploadProgress(pct);
-          setUploadStatusText(msg);
+          if (pct < 40) {
+            setUploadStatusText(`Step 1/3: Extracting 16kHz audio from video... (${pct}%)`);
+          } else if (pct < 80) {
+            setUploadStatusText(`Step 2/3: Gemini 2.5 Flash Native Audio transcribing & diarizing...`);
+          } else {
+            setUploadStatusText(`Step 3/3: Gemini 2.5 Flash analyzing dialogue & speaker ratings...`);
+          }
         }
       });
+
+      const compiledDialogue = pipelineResult?.rawTranscript || pipelineResult?.transcriptText || "";
+
+      const audioResult = {
+        meetingId: pipelineResult.meetingId || `meeting_${Date.now()}`,
+        transcriptText: compiledDialogue,
+        rawTranscript: compiledDialogue,
+        dialogueTurns: pipelineResult.dialogueTurns || [],
+        speakerRatings: pipelineResult.speakerRatings || {},
+        factCheckAudit: pipelineResult.factCheckAudit || [],
+        speakers: pipelineResult.speakers || {
+          speaker_0: host,
+          speaker_1: participantList[0] || 'Participant 1'
+        },
+        model: pipelineResult.model || 'whisper-large-v3',
+        gemini_model: pipelineResult.gemini_model || 'gemini-2.5-flash',
+        storageUrl: pipelineResult.downloadUrl || '',
+        status: 'completed'
+      };
 
       const now = new Date();
       const optionsDate = { month: 'short', day: 'numeric', year: 'numeric' };
@@ -545,8 +586,8 @@ function App() {
         time: now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
         fluency: `${Math.round((audioResult.meetingInsights?.averageFluency || 8.2) * 10)}% Fluency`,
         status: "positive",
-        sentiment: `${audioResult.speakerCount} Speakers Isolated`,
-        videoUrl: audioResult.masterAudioUrl,
+        sentiment: `${audioResult.speakerCount || 2} Speakers Isolated`,
+        videoUrl: audioResult.masterAudioUrl || audioResult.storageUrl,
         analysisData: audioResult
       };
 
@@ -663,22 +704,25 @@ function App() {
     setUploadStatusText(`Step 1/3: Extracting 16kHz audio from video footage...`);
 
     try {
-      const liveHostName = hostName || auth?.currentUser?.displayName || (auth?.currentUser?.email ? auth.currentUser.email.split('@')[0] : 'Host');
-      const liveGuestName = 'Participant';
+      const liveHostName = vid.hostName || hostName || auth?.currentUser?.displayName || (auth?.currentUser?.email ? auth.currentUser.email.split('@')[0] : 'Host');
+      const liveParticipants = Array.isArray(vid.participantNames) && vid.participantNames.length > 0
+        ? vid.participantNames
+        : (vid.guestName ? [vid.guestName] : ['Participant 1']);
+      const liveGuestName = liveParticipants[0] || 'Participant 1';
 
-      // Real-World Pipeline: Send actual video footage to FFmpeg + Groq Whisper + Gemini 1.5 Flash
+      // Real-World Pipeline: Send actual video footage to FFmpeg + Gemini 2.5 Flash Native Audio
       const pipelineResult = await analyzeVideoWithGroqAndGemini(file, {
         meetingId,
         hostName: liveHostName,
-        participantNames: [liveGuestName],
+        participantNames: liveParticipants,
         onProgress: (p) => {
           setUploadProgress(p);
           if (p < 40) {
             setUploadStatusText(`Step 1/3: Streaming video footage (${p}%)...`);
           } else if (p < 80) {
-            setUploadStatusText(`Step 2/3: Groq OpenAI Whisper Large-V3 transcribing audio...`);
+            setUploadStatusText(`Step 2/3: Gemini 2.5 Flash Native Audio transcribing & diarizing...`);
           } else {
-            setUploadStatusText(`Step 3/3: Google Gemini 1.5 Flash analyzing dialogue & speaker ratings...`);
+            setUploadStatusText(`Step 3/3: Google Gemini 2.5 Flash analyzing dialogue & speaker ratings...`);
           }
         }
       });
@@ -704,7 +748,7 @@ function App() {
           speaker_1: liveGuestName
         },
         model: pipelineResult?.model || 'whisper-large-v3',
-        gemini_model: pipelineResult?.gemini_model || 'gemini-1.5-flash',
+        gemini_model: pipelineResult?.gemini_model || 'gemini-2.5-flash',
         storageUrl: pipelineResult?.downloadUrl || '',
         status: 'completed'
       };
@@ -715,9 +759,9 @@ function App() {
         duration: vid.duration || "Analyzed",
         date: now.toLocaleDateString('en-US', optionsDate),
         time: now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
-        fluency: "Groq Whisper + Gemini",
+        fluency: "Gemini 2.5 Flash Native",
         status: "positive",
-        sentiment: "Gemini 1.5 Flash",
+        sentiment: "Gemini 2.5 Flash",
         videoUrl: pipelineResult?.downloadUrl || '',
         analysisData: audioResult
       };
@@ -784,7 +828,8 @@ function App() {
         initialData={extractedAudioData}
         meetingId={extractedAudioData?.meetingId || extractedAudioData?.meetingCode}
         hostName={hostName || auth?.currentUser?.displayName || (auth?.currentUser?.email ? auth.currentUser.email.split('@')[0] : 'Host')}
-        guestName={extractedAudioData?.guestName || (Array.isArray(extractedAudioData?.participantNames) && extractedAudioData.participantNames[0]) || 'Participant'}
+        guestName={extractedAudioData?.guestName || (Array.isArray(extractedAudioData?.participantNames) && extractedAudioData.participantNames[0]) || 'Participant 1'}
+        participantNames={extractedAudioData?.participantNames || (uploadParticipants ? uploadParticipants.split(',').map(s => s.trim()).filter(Boolean) : [])}
         onBack={() => setPhase('dashboard')}
       />
     );
@@ -999,20 +1044,18 @@ function App() {
               </div>
             )}
 
-            {isRegisterMode && (
-              <div className="form-group">
-                <label htmlFor="host-display-name">FULL NAME</label>
-                <input
-                  type="text"
-                  id="host-display-name"
-                  className="text-input"
-                  placeholder="e.g. Abhishek"
-                  value={displayNameInput}
-                  onChange={(e) => setDisplayNameInput(e.target.value)}
-                  required
-                />
-              </div>
-            )}
+            <div className="form-group">
+              <label htmlFor="host-display-name">YOUR NAME (HOST DISPLAY NAME)</label>
+              <input
+                type="text"
+                id="host-display-name"
+                className="text-input"
+                placeholder={isRegisterMode ? "Enter your full name" : "Enter your name (e.g. Gnanesh)"}
+                value={displayNameInput}
+                onChange={(e) => setDisplayNameInput(e.target.value)}
+                required={isRegisterMode}
+              />
+            </div>
 
             <div className="form-group">
               <label htmlFor="host-email">GMAIL / EMAIL ID</label>
@@ -1238,6 +1281,30 @@ function App() {
             <Download size={14} />
             <span>Download Codebase (.txt)</span>
           </a>
+
+          <button
+            onClick={() => downloadPresentationPdf()}
+            className="download-ppt-guide-btn"
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '6px',
+              padding: '6px 14px',
+              borderRadius: '20px',
+              background: 'linear-gradient(135deg, #0284c7 0%, #0369a1 100%)',
+              color: '#ffffff',
+              border: 'none',
+              fontSize: '0.8rem',
+              fontWeight: '600',
+              cursor: 'pointer',
+              boxShadow: '0 2px 8px rgba(2, 132, 199, 0.35)',
+              transition: 'all 0.2s ease'
+            }}
+            title="Download Presentation & Viva Master Q&A Guide (.pdf)"
+          >
+            <FileText size={14} />
+            <span>Download PPT Guide (.pdf)</span>
+          </button>
 
           <div className="greeting-text">
             Hii <span>{hostName}</span>
@@ -1532,7 +1599,7 @@ function App() {
                     type="text"
                     id="upload-host-name"
                     className="text-input"
-                    placeholder="e.g. Abhishek (Host)"
+                    placeholder="Enter host name (e.g. Host)"
                     value={uploadHostName}
                     onChange={(e) => setUploadHostName(e.target.value)}
                   />

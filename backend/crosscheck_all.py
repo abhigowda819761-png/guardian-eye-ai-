@@ -39,7 +39,7 @@ def run_crosscheck():
     if ffmpeg != "ffmpeg":
         assert os.path.exists(ffmpeg), f"FFmpeg not found at {ffmpeg}"
 
-    # Speaker 1 (Abhishek - Host): 135 Hz pitch, 3.0s
+    # Speaker 1 (Host): 135 Hz pitch, 3.0s
     t1 = np.linspace(0, 3.0, int(sr * 3.0))
     s1 = 0.5 * np.sin(2 * np.pi * 135 * t1)
     sil1 = np.zeros(int(sr * 0.8)) # 0.8s silence
@@ -54,7 +54,7 @@ def run_crosscheck():
     s3 = 0.5 * np.sin(2 * np.pi * 175 * t3)
     sil3 = np.zeros(int(sr * 0.8))
 
-    # Speaker 1 returns (Abhishek - Host): 135 Hz pitch, 2.5s
+    # Speaker 1 returns (Host): 135 Hz pitch, 2.5s
     t4 = np.linspace(0, 2.5, int(sr * 2.5))
     s4 = 0.5 * np.sin(2 * np.pi * 135 * t4)
 

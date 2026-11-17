@@ -145,8 +145,8 @@ def test_rest_apis(mp4_path: str):
     try:
         status, data = http_post(f"{API_BASE}/api/meetings/create", {
             "topic": "Pre-Launch Verification Session",
-            "hostEmail": "abhi@gmail.com",
-            "hostName": "Abhishek S."
+            "hostEmail": "host@gmail.com",
+            "hostName": "Host"
         })
         room_code = data.get("room", {}).get("code")
         record_test("POST /api/meetings/create", status == 200 and bool(room_code), f"Created room: {room_code}")
@@ -262,7 +262,7 @@ async def test_webrtc_signaling_and_capacity(room_code: str):
 
     # Connect Host
     host_ws = await websockets.connect(uri)
-    await host_ws.send(json.dumps({"role": "host", "name": "Abhishek S. (Host)"}))
+    await host_ws.send(json.dumps({"role": "host", "name": "Host"}))
     host_init = json.loads(await host_ws.recv())
     record_test("WebSocket Host Handshake", host_init.get("type") == "host_ready", f"Max: {host_init.get('maxParticipants')}")
 

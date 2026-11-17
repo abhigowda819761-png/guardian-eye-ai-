@@ -38,7 +38,7 @@ function resolveAudioUrl(url, baseUrl) {
  *
  * @example
  * // Simple usage:
- * const result = await analyzeVideoMeeting(videoFile, 'Abhishek', 'Participant 1, Participant 2');
+ * const result = await analyzeVideoMeeting(videoFile, 'Host', 'Participant 1, Participant 2');
  * if (result.success) {
  *   console.log('Turns:', result.data.timeline);
  * } else {
@@ -48,7 +48,7 @@ function resolveAudioUrl(url, baseUrl) {
  * @example
  * // Options object usage:
  * const result = await analyzeVideoMeeting(videoBlob, {
- *   host_name: 'Abhishek (Host)',
+ *   host_name: 'Host',
  *   participant_names: ['John', 'Sarah'],
  *   onUploadProgress: (pct) => setUploadProgress(pct)
  * });
@@ -352,7 +352,78 @@ export function formatSecondsToTime(sec) {
   return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
 }
 
+/**
+ * Direct Real-World Video Footage Analysis via Gemini Multimodal Audio Pipeline:
+ * Sends the actual video file (blob/mp4/webm) to POST /api/meeting/analyze-video on localhost:8000.
+ *
+ * @param {File|Blob} file - Recorded video file
+ * @param {Object} options - { meetingId, hostName, participantNames, onProgress }
+ * @returns {Promise<Object>} Formatted analytical payload with verbatim turns, 5-metric ratings, and fact-check audit
+ */
+export async function analyzeVideoWithGemini(file, { meetingId, hostName, participantNames, onProgress } = {}) {
+  const cleanMeetingId = meetingId || `meeting_${Date.now()}`;
+  const cleanHost = (hostName && hostName.trim()) ? hostName.trim() : 'Host';
+  const cleanParticipantsList = Array.isArray(participantNames)
+    ? participantNames.map(p => String(p).trim()).filter(Boolean).slice(0, 4)
+    : (typeof participantNames === 'string' && participantNames.trim()
+        ? participantNames.split(',').map(p => p.trim()).filter(Boolean).slice(0, 4)
+        : ['Participant 1']);
+
+  const createFormData = () => {
+    const fd = new FormData();
+    fd.append('file', file, file.name || `${cleanMeetingId}.mp4`);
+    fd.append('meetingId', cleanMeetingId);
+    fd.append('hostName', cleanHost);
+    fd.append('participantNames', JSON.stringify(cleanParticipantsList));
+    return fd;
+  };
+
+  // Prioritize same-origin Vite proxy (/api/...) first to avoid CORS / PNA / IPv6 connection issues!
+  const candidateUrls = [
+    '/api/meeting/analyze-video',
+    `${API_BASE_URL ? API_BASE_URL.replace(/\/+$/, '') : ''}/api/meeting/analyze-video`,
+    'http://127.0.0.1:8000/api/meeting/analyze-video',
+    'http://localhost:8000/api/meeting/analyze-video',
+    `http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:8000/api/meeting/analyze-video`
+  ].filter((u, i, a) => u && a.indexOf(u) === i);
+
+  let lastError = null;
+  for (const url of candidateUrls) {
+    try {
+      if (onProgress) onProgress(25);
+      const res = await fetch(url, {
+        method: 'POST',
+        body: createFormData()
+      });
+      if (res.ok) {
+        if (onProgress) onProgress(90);
+        const data = await res.json();
+        if (data && (data.success || data.rawTranscript || data.dialogueTurns)) {
+          if (onProgress) onProgress(100);
+          return data;
+        }
+      } else {
+        const errData = await res.json().catch(() => ({}));
+        const msg = errData.detail || errData.error || errData.message || `Backend HTTP ${res.status}`;
+        throw new Error(msg);
+      }
+    } catch (err) {
+      lastError = err;
+      console.warn(`[videoAnalysisService] Endpoint ${url} note:`, err.message);
+      if (err.message && !err.message.includes('Failed to fetch') && !err.message.includes('NetworkError')) {
+        throw err;
+      }
+    }
+  }
+
+  throw lastError || new Error('Failed to reach FastAPI backend at http://localhost:8000/api/meeting/analyze-video');
+}
+
+export const analyzeVideoWithGroqAndGemini = analyzeVideoWithGemini;
+
 export default {
   analyzeVideoMeeting,
+  analyzeVideoWithGemini,
+  analyzeVideoWithGroqAndGemini,
   formatSecondsToTime
 };

@@ -316,8 +316,8 @@ def format_dialogue_document(
 ) -> str:
     """
     Formats the finalized script as a clean dialogue document text (.txt) exactly like:
-      James: hii hassassin
-      Hassassin: hello james
+      Host: hello everyone
+      Participant: hi host
     """
     lines = []
     current_speaker = None

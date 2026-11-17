@@ -1,0 +1,572 @@
+#!/usr/bin/env python3
+"""
+Guardian Eye AI — Presentation & Viva Master Q&A Guide PDF Generator
+Compiles the complete 25-section architecture, algorithms, and viva answers into
+GuardianEye_AI_Presentation_Guide.pdf in the project root and frontend/public/.
+"""
+
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+HTML_CONTENT = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Guardian Eye AI — Complete Presentation, Architecture & Viva Guide</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+  @page {
+    size: A4;
+    margin: 16mm 16mm 16mm 16mm;
+    @bottom-right {
+      content: "Page " counter(page);
+      font-family: 'Inter', sans-serif;
+      font-size: 8pt;
+      color: #64748b;
+    }
+  }
+
+  * {
+    box-sizing: border-box;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    color: #0f172a;
+    background: #ffffff;
+    line-height: 1.55;
+    font-size: 9.5pt;
+    margin: 0;
+    padding: 0;
+  }
+
+  /* Cover / Title Banner */
+  .doc-header {
+    border-bottom: 2px solid #0284c7;
+    padding-bottom: 14px;
+    margin-bottom: 22px;
+  }
+
+  .badge-row {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+
+  .badge {
+    display: inline-block;
+    padding: 3px 9px;
+    border-radius: 4px;
+    font-size: 7.5pt;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  .badge-blue { background: #e0f2fe; color: #0284c7; border: 1px solid #bae6fd; }
+  .badge-purple { background: #f3e8ff; color: #7e22ce; border: 1px solid #e9d5ff; }
+  .badge-green { background: #dcfce7; color: #15803d; border: 1px solid #bbf7d0; }
+
+  h1.main-title {
+    font-size: 20pt;
+    font-weight: 800;
+    color: #0f172a;
+    margin: 0 0 6px 0;
+    letter-spacing: -0.5px;
+  }
+
+  .subtitle {
+    font-size: 10.5pt;
+    color: #475569;
+    margin: 0;
+    font-weight: 500;
+  }
+
+  .meta-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 10px;
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 6px;
+    padding: 10px 14px;
+    margin-top: 14px;
+    font-size: 8pt;
+  }
+
+  .meta-item strong {
+    display: block;
+    color: #64748b;
+    font-size: 7pt;
+    text-transform: uppercase;
+    margin-bottom: 2px;
+  }
+
+  /* Part Headers */
+  .part-header {
+    background: linear-gradient(135deg, #0f172a, #1e293b);
+    color: #ffffff;
+    padding: 9px 14px;
+    border-radius: 6px;
+    margin: 24px 0 14px 0;
+    page-break-after: avoid;
+    break-after: avoid;
+  }
+
+  .part-header h2 {
+    font-size: 11pt;
+    font-weight: 700;
+    margin: 0;
+    letter-spacing: 0.3px;
+  }
+
+  /* Question Cards */
+  .qa-card {
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-left: 4px solid #0284c7;
+    border-radius: 6px;
+    padding: 12px 14px;
+    margin-bottom: 12px;
+    page-break-inside: avoid;
+    break-inside: avoid;
+  }
+
+  .qa-card.purple { border-left-color: #8b5cf6; }
+  .qa-card.emerald { border-left-color: #10b981; }
+  .qa-card.amber { border-left-color: #f59e0b; }
+
+  .q-title {
+    font-size: 10pt;
+    font-weight: 700;
+    color: #0f172a;
+    margin: 0 0 8px 0;
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+  }
+
+  .q-num {
+    color: #0284c7;
+    font-weight: 800;
+  }
+
+  .answer-text {
+    font-size: 9pt;
+    color: #334155;
+    margin: 0;
+    line-height: 1.5;
+  }
+
+  .answer-text p {
+    margin: 0 0 6px 0;
+  }
+
+  .answer-text p:last-child {
+    margin-bottom: 0;
+  }
+
+  .answer-text strong {
+    color: #0f172a;
+  }
+
+  /* Step Pills & Highlights */
+  .step-list {
+    margin: 6px 0 6px 16px;
+    padding: 0;
+  }
+
+  .step-list li {
+    margin-bottom: 4px;
+  }
+
+  .tech-pill {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 7.5pt;
+    background: #f1f5f9;
+    color: #0f172a;
+    padding: 1px 5px;
+    border-radius: 3px;
+    border: 1px solid #cbd5e1;
+  }
+
+  .formula-box {
+    background: #f8fafc;
+    border: 1px dashed #cbd5e1;
+    border-radius: 4px;
+    padding: 6px 10px;
+    margin: 6px 0;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 8pt;
+    color: #0369a1;
+  }
+
+  .page-break {
+    page-break-before: always;
+    break-before: always;
+  }
+</style>
+</head>
+<body>
+
+  <!-- DOCUMENT HEADER -->
+  <div class="doc-header">
+    <div class="badge-row">
+      <span class="badge badge-blue">Guardian Eye AI</span>
+      <span class="badge badge-purple">Viva & Architecture Master Guide</span>
+      <span class="badge badge-green">Production Ready</span>
+    </div>
+    <h1 class="main-title">Guardian Eye AI — Master Architecture & Viva Guide</h1>
+    <p class="subtitle">Complete technical, algorithmic, and operational questions answered in simple paragraphs.</p>
+    <div class="meta-grid">
+      <div class="meta-item"><strong>Frontend</strong>React 19 + Vite (Port 5173)</div>
+      <div class="meta-item"><strong>Core Backend</strong>FastAPI Python (Port 8000)</div>
+      <div class="meta-item"><strong>Signaling Server</strong>PeerJS Node.js (Port 9000)</div>
+      <div class="meta-item"><strong>AI Models</strong>Groq Whisper V3 &amp; Gemini Flash</div>
+    </div>
+  </div>
+
+  <!-- PART 1: CORE WORKFLOW, LOGIN & DATA FLOW -->
+  <div class="part-header">
+    <h2>PART 1: CORE WORKFLOW, LOGIN &amp; DATA FLOW</h2>
+  </div>
+
+  <!-- Q1 -->
+  <div class="qa-card">
+    <div class="q-title"><span class="q-num">Q1.</span> What is Guardian Eye AI and how does the end-to-end workflow operate?</div>
+    <div class="answer-text">
+      <p><strong>Answer:</strong> Guardian Eye AI is an enterprise multimodal video meeting and communication auditing platform. It allows users to run live meetings or upload pre-recorded videos to get an instant, objective evaluation of how each person communicates.</p>
+      <p>The end-to-end workflow has five clear steps: First, the user selects their role as Host or Participant. Second, the Host logs in while Participants enter a 6-character room code. Third, participants meet in a real-time WebRTC room (supporting up to 5 members) or upload a meeting video. Fourth, FFmpeg extracts clean 16kHz audio, Groq Whisper transcribes verbatim dialogue, and acoustic clustering detects who spoke what. Fifth, Google Gemini Flash grades each speaker out of 10 on communication metrics, audits question-and-answer exchanges for accuracy, and renders an interactive dashboard with instant PDF export.</p>
+    </div>
+  </div>
+
+  <!-- Q2 -->
+  <div class="qa-card">
+    <div class="q-title"><span class="q-num">Q2.</span> What is the complete Data Flow across the system?</div>
+    <div class="answer-text">
+      <p><strong>Answer:</strong> Data flows cleanly across four connected layers:</p>
+      <p><strong>1. Client Layer (Port 5173):</strong> The React 19 frontend captures webcam video, microphone audio, and user actions. It handles live volume metering and file uploads.</p>
+      <p><strong>2. Signaling Layer (Port 9000):</strong> The Node.js PeerJS server routes knock requests, room joins, and WebRTC handshakes between browsers so media streams connect directly peer-to-peer.</p>
+      <p><strong>3. Core Backend Layer (Port 8000):</strong> The FastAPI Python backend handles user login, runs FFmpeg audio extraction, coordinates Groq Whisper transcription, and runs Gemini AI scoring.</p>
+      <p><strong>4. Persistence Layer:</strong> SQLite (<span class="tech-pill">guardianeye.db</span>) stores user accounts and room states. Browser IndexedDB stores recorded video files, and localStorage caches offline reports.</p>
+    </div>
+  </div>
+
+  <!-- Q3 -->
+  <div class="qa-card">
+    <div class="q-title"><span class="q-num">Q3.</span> How does User Login work, how is the Gmail ID and password verified, and where is the password stored?</div>
+    <div class="answer-text">
+      <p><strong>Answer:</strong> When a user logs in, the frontend checks that the email ends with <span class="tech-pill">@gmail.com</span> (automatically appending it if missing) and ensures the password has at least 6 characters.</p>
+      <p>The password is verified using the industry-standard <strong>Bcrypt</strong> hashing algorithm with 12 salt rounds (4,096 computation cycles). The system never stores plaintext passwords. When a user registers, Bcrypt generates a secure one-way salted hash. On login, Bcrypt verifies the submitted password against the stored hash in the <span class="tech-pill">users</span> table of SQLite database <span class="tech-pill">guardianeye.db</span>. If verified, the server issues a session token. When cloud mode is enabled, it also authenticates via Google Firebase Auth.</p>
+    </div>
+  </div>
+
+  <!-- PART 2: LIVE MEETING ROOM, WEBRTC CONNECTIVITY & ALGORITHMS -->
+  <div class="part-header">
+    <h2>PART 2: LIVE MEETING ROOM, WEBRTC CONNECTIVITY &amp; ALGORITHMS</h2>
+  </div>
+
+  <!-- Q4 -->
+  <div class="qa-card purple">
+    <div class="q-title"><span class="q-num">Q4.</span> How does clicking "Create New" work and how does it open the camera?</div>
+    <div class="answer-text">
+      <p><strong>Answer:</strong> Clicking "Create New" triggers the meeting setup modal, sends a creation request to <span class="tech-pill">POST /api/meetings/create</span> to register the room code, and mounts the live <span class="tech-pill">MeetingRoom.jsx</span> component.</p>
+      <p>The camera is accessed via a 4-stage progressive hardware fallback: Stage 1 asks for 720p HD video at 30 fps with echo cancellation, noise suppression, and auto gain control. If the camera rejects HD, Stage 2 requests basic video and audio. If the microphone is in use by another app, Stage 3 requests video only. If no camera exists, Stage 4 requests audio only. The stream is attached directly to the local video element on screen.</p>
+    </div>
+  </div>
+
+  <!-- Q5 -->
+  <div class="qa-card purple">
+    <div class="q-title"><span class="q-num">Q5.</span> How does the Unique Room Code generation algorithm work?</div>
+    <div class="answer-text">
+      <p><strong>Answer:</strong> Room codes use an unambiguous 6-character Base-32 alphanumeric sampling algorithm formatted as <span class="tech-pill">XXX-XXX</span> (such as <span class="tech-pill">W4K-9P2</span>).</p>
+      <p>The algorithm picks randomly from the character set <span class="tech-pill">ABCDEFGHJKLMNPQRSTUVWXYZ23456789</span>. Confusing characters like 0, O, 1, and I are completely excluded so users never misread codes. Clicking the code badge in the meeting copies a direct link (<span class="tech-pill">http://localhost:5173/?join=W4K-9P2</span>). When a guest opens this link, the app automatically pre-fills the room code on their screen.</p>
+    </div>
+  </div>
+
+  <!-- Q6 -->
+  <div class="qa-card purple">
+    <div class="q-title"><span class="q-num">Q6.</span> How does the Join Request ("Knock" Notification) work when a Participant asks to join?</div>
+    <div class="answer-text">
+      <p><strong>Answer:</strong> When a participant enters a room code, their browser calls the backend to find the Host's active peer connection. It then opens a reliable WebRTC data channel and sends a <span class="tech-pill">knock</span> packet with the participant's name.</p>
+      <p>While the participant sees a waiting screen, a floating notification pops up on the Host's screen with the guest's name and Accept / Reject buttons. When the Host clicks Accept, the system verifies that the room has fewer than 5 members, approves the join request, notifies all existing peers, and initiates peer-to-peer audio/video calls.</p>
+    </div>
+  </div>
+
+  <!-- Q7 -->
+  <div class="qa-card purple">
+    <div class="q-title"><span class="q-num">Q7.</span> What algorithms are used to connect multiple users' video and audio smoothly over the internet?</div>
+    <div class="answer-text">
+      <p><strong>Answer:</strong> Four optimization algorithms work together to keep video calls smooth without lag:</p>
+      <p><strong>1. Full-Mesh P2P with 8 STUN Servers:</strong> Connects browsers directly using Google and Cloudflare STUN servers to bypass residential firewalls and home routers.</p>
+      <p><strong>2. SDP Codec Prioritization:</strong> Modifies the WebRTC session handshake text to prioritize hardware-accelerated H.264 and VP8 codecs, keeping CPU usage low.</p>
+      <p><strong>3. Bandwidth Bitrate Capping:</strong> Caps video at 500 kbps (24 fps) while giving audio high priority, ensuring voices never stutter even on slow internet.</p>
+      <p><strong>4. Adaptive Congestion Control:</strong> Monitors frame drops every 3.5 seconds. If packet loss exceeds 25%, it downscales video to 250 kbps; when stable, it restores full quality automatically.</p>
+    </div>
+  </div>
+
+  <!-- Q8 -->
+  <div class="qa-card purple">
+    <div class="q-title"><span class="q-num">Q8.</span> How does the Microphone button, Default Mute, and Live Active-Speaker Detection work?</div>
+    <div class="answer-text">
+      <p><strong>Answer:</strong> Every participant enters the room muted by default (<span class="tech-pill">audioOn = false</span>) to avoid sudden feedback or background noise. Users must click the Mic button to unmute.</p>
+      <p>Clicking the Mic toggles the audio track and sends an update packet across data channels so everyone sees the live mic status. For active speaker detection, the Web Audio API connects a Fast Fourier Transform (FFT) analyser to each audio stream. Every 100 milliseconds, it measures sound volume across 128 frequencies. The person speaking with the highest energy above the noise floor is highlighted on screen with an active speaker badge.</p>
+    </div>
+  </div>
+
+  <!-- Q9 -->
+  <div class="qa-card purple">
+    <div class="q-title"><span class="q-num">Q9.</span> How does the Record Button work in the live meeting room?</div>
+    <div class="answer-text">
+      <p><strong>Answer:</strong> Clicking Record triggers the browser screen-sharing dialog to capture the video grid. Because standard browser recording only captures one audio track, Guardian Eye AI uses a custom Web Audio API multi-source audio mixer.</p>
+      <p>The mixer blends the host's microphone, all remote participants' incoming voices, and system tab sounds into one high-quality audio stream. A MediaRecorder encodes video and mixed audio into a WebM/MP4 file. When recording stops, the file is saved to IndexedDB, downloaded to the user's computer, and sent to the AI pipeline for instant transcription and scoring.</p>
+    </div>
+  </div>
+
+  <!-- PART 3: STORAGE, VIDEO UPLOAD, API KEYS & AI PIPELINE ALGORITHMS -->
+  <div class="part-header">
+    <h2>PART 3: STORAGE, VIDEO UPLOAD, API KEYS &amp; AI PIPELINE ALGORITHMS</h2>
+  </div>
+
+  <!-- Q10 -->
+  <div class="qa-card emerald">
+    <div class="q-title"><span class="q-num">Q10.</span> How does the History section work and where does the app store all its data?</div>
+    <div class="answer-text">
+      <p><strong>Answer:</strong> The app uses a layered storage architecture for maximum speed and offline support:</p>
+      <p>Recorded video files are stored in browser <strong>IndexedDB</strong> (<span class="tech-pill">GuardianEyeRecordingsDB</span>), allowing instant playback and deletion without consuming cloud bandwidth. Meeting summaries, scores, and transcripts are stored in <strong>SQLite</strong> on the backend and cached in browser <strong>localStorage</strong>. When cloud synchronization is active, records also sync to Google Cloud Firestore.</p>
+    </div>
+  </div>
+
+  <!-- Q11 -->
+  <div class="qa-card emerald">
+    <div class="q-title"><span class="q-num">Q11.</span> How does "Upload Recorded Meeting" extract audio and detect "Who Spoke What" (Speaker Diarization)?</div>
+    <div class="answer-text">
+      <p><strong>Answer:</strong> When a user uploads any video, a four-stage acoustic and AI pipeline processes the file:</p>
+      <p><strong>Stage 1 (FFmpeg Audio Extraction):</strong> Strips video frames and extracts clean 16,000 Hz, 16-bit mono WAV audio. For lightweight base64 delivery, it also creates a compact 48kbps MP3 under 15 MB.</p>
+      <p><strong>Stage 2 (Voice Activity Detection - VAD):</strong> Analyzes root-mean-square energy across 50ms windows with an adaptive noise floor to isolate true speech segments from silence and background hum.</p>
+      <p><strong>Stage 3 (6D Acoustic Voiceprint Clustering):</strong> Calculates 6 mathematical features for each speech segment: Pitch frequency (F0), Spectral Centroid (brightness), Bandwidth, Rolloff, Zero-Crossing Rate, and Energy. Segments are clustered by voice distance into distinct speakers.</p>
+      <p><strong>Stage 4 (Google Gemini 2.5 Flash Native Audio Diarization):</strong> Gemini 2.5 Flash listens directly to the audio waveform, transcribes every turn verbatim with filler words, and maps each unique vocal pitch and turn-taking exchange directly to the user-entered participant names.</p>
+    </div>
+  </div>
+
+  <!-- Q12 -->
+  <div class="qa-card emerald">
+    <div class="q-title"><span class="q-num">Q12.</span> How do the Dual Gemini API Keys work, how did we get them, and how are they aligned in the backend?</div>
+    <div class="answer-text">
+      <p><strong>Answer:</strong> The system uses two dedicated Google Gemini API keys stored safely in <span class="tech-pill">backend/.env</span> for intelligent load splitting:</p>
+      <p><span class="tech-pill">GEMINI_API_KEY_PRIMARY</span>: Dedicated to heavy multimodal audio ingestion, diarization, and verbatim speech-to-text.</p>
+      <p><span class="tech-pill">GEMINI_API_KEY_SECONDARY</span>: Dedicated to cognitive 1–10 metric scoring, executive summarization, and Q&amp;A fact-checking audits.</p>
+      <p>Both keys are obtained from Google AI Studio (<span class="tech-pill">aistudio.google.com</span>) and are kept strictly on the server. If either key reaches Google API rate limits or quota, automatic failover instantly routes requests to the alternate key.</p>
+    </div>
+  </div>
+
+  <!-- PART 4: SCORING ENGINE, RUBRICS & FACT-CHECKING -->
+  <div class="part-header">
+    <h2>PART 4: SCORING ENGINE, RUBRICS &amp; FACT-CHECKING</h2>
+  </div>
+
+  <!-- Q13 -->
+  <div class="qa-card amber">
+    <div class="q-title"><span class="q-num">Q13.</span> How does the Scoring Engine work and on what basis does it give marks out of 10?</div>
+    <div class="answer-text">
+      <p><strong>Answer:</strong> The scoring engine combines hard mathematical speech measurements with Gemini AI auditing so grades are genuine and unbiased without default high scores:</p>
+      <p>First, the system calculates exact speech telemetry: Words Per Minute (optimal: 115–155 WPM), filler word count (such as "um", "uh", "like"), and hesitation pauses between 1.8 and 8 seconds.</p>
+      <p>Next, Gemini grades each speaker across 6 core numerical parameters on a strict 1 to 10 scale plus pragmatic delivery style: <strong>Communication Skills</strong> (clarity and structure), <strong>Fluency</strong> (smooth delivery and pacing), <strong>Confidence</strong> (decisive phrasing vs. tentative hedging), <strong>Awkwardness</strong> (inverted: 1/10 is smooth, higher numbers penalize heavy fillers and long pauses), <strong>Straightforward Answers</strong> (directness without dodging questions), <strong>Persuasive Assertiveness</strong> (1–10, measuring conviction, authoritative posture, and rhetorical impact), and <strong>Tone Style &amp; Delivery Vector</strong> (identifies the speaker's pragmatic stance: <em>Commanding</em>, <em>Requesting</em>, <em>Polite</em>, or <em>Collaborative</em>).</p>
+      <p>Anti-hallucination guardrails enforce accuracy: If a person speaks fewer than 4 words (20 characters), their score is clamped to 1.0/10 with an "Insufficient text" notice. High filler rates (&gt;6%) or multiple pauses automatically cap fluency and increase awkwardness.</p>
+      <div class="formula-box">Executive Score = 0.25*(Skills) + 0.25*(Fluency) + 0.20*(Confidence) + 0.20*(Straightforward) + 0.10*(11 - Awkwardness)</div>
+    </div>
+  </div>
+
+  <!-- Q14 -->
+  <div class="qa-card amber">
+    <div class="q-title"><span class="q-num">Q14.</span> How does the Fact-Checking &amp; Q&amp;A Audit engine work?</div>
+    <div class="answer-text">
+      <p><strong>Answer:</strong> The engine inspects every conversation turn to identify questions and pairs them with the responder's answer.</p>
+      <p>Questions are detected via question marks or interrogative starters (What, How, Why, When, Where, Who, Can, Could). The system pairs the question with the response and classifies the answer into one of three strict verdicts: <strong>Accurate</strong> (green badge, directly and factually answers the question), <strong>Incomplete</strong> (amber badge, vague, missing details, or relies on heavy fillers), or <strong>Evasive</strong> (red badge, deflects the question or uses evasive phrasing like "not sure" or "hard to say").</p>
+    </div>
+  </div>
+
+  <!-- PART 5: ADVANCED CODEBASE CAPABILITIES & SECURITY -->
+  <div class="part-header">
+    <h2>PART 5: ADVANCED CODEBASE CAPABILITIES &amp; SECURITY</h2>
+  </div>
+
+  <!-- Q15 -->
+  <div class="qa-card">
+    <div class="q-title"><span class="q-num">Q15.</span> How do "Pin User", "Raise Hand", "Kick Participant", and "Meeting Notes" work?</div>
+    <div class="answer-text">
+      <p><strong>Answer:</strong> These features provide full interactive control inside the live room:</p>
+      <p><strong>Pin User:</strong> Highlights a chosen video tile with a cyan glowing border and locks the active speaker indicator onto that person. <strong>Raise Hand:</strong> Displays an animated hand icon on the user's video tile and broadcasts the state to all peers. <strong>Host Kick:</strong> Allows the host to remove a participant; confirming sends a kick message over the data channel and closes their video connection. <strong>Meeting Notes:</strong> Opens a notepad that automatically saves every typed character to browser localStorage so notes are never lost.</p>
+    </div>
+  </div>
+
+  <!-- Q16 -->
+  <div class="qa-card">
+    <div class="q-title"><span class="q-num">Q16.</span> What is the 7-Dimension Communication Coach in the backend?</div>
+    <div class="answer-text">
+      <p><strong>Answer:</strong> In addition to the meeting scorecard, the backend includes an executive coaching engine (<span class="tech-pill">/api/ai/coach</span>) that evaluates speech on a 0 to 100 scale across 7 dimensions: Verbal Clarity (20%), Speaking Fluency (15%), Vocabulary Expression (15%), Presentation Structure (15%), Active Listening (15%), Professionalism (10%), and Conciseness (10%). It cites exact quotes and generates a step-by-step improvement practice plan.</p>
+    </div>
+  </div>
+
+  <!-- Q17 -->
+  <div class="qa-card">
+    <div class="q-title"><span class="q-num">Q17.</span> How does the local Apple Silicon GPU (MPS) and PyAnnote pipeline work?</div>
+    <div class="answer-text">
+      <p><strong>Answer:</strong> On macOS machines with Apple Silicon (M1/M2/M3), the backend automatically enables Apple Metal Performance Shaders (<span class="tech-pill">torch.device('mps')</span>) for hardware acceleration. It can run local PyAnnote diarization and local Whisper transcription directly on the Mac's neural engine without sending audio to external clouds.</p>
+    </div>
+  </div>
+
+  <!-- Q18 -->
+  <div class="qa-card">
+    <div class="q-title"><span class="q-num">Q18.</span> What happens if the backend server or internet is completely offline during audio analysis?</div>
+    <div class="answer-text">
+      <p><strong>Answer:</strong> The app includes a 100% browser-native Web Audio API fallback engine (<span class="tech-pill">audioAnalyzer.js</span>). If the backend is unreachable, the browser decodes the audio file directly into memory, computes speech energy windows, runs client-side voice activity detection, and displays speaker communication metrics without crashing.</p>
+    </div>
+  </div>
+
+  <!-- Q19 -->
+  <div class="qa-card">
+    <div class="q-title"><span class="q-num">Q19.</span> How does the Multi-Page PDF Report Export work?</div>
+    <div class="answer-text">
+      <p><strong>Answer:</strong> Clicking "Download PDF Report" uses <span class="tech-pill">html2canvas</span> to capture the report dashboard at high Retina resolution (scale: 2) while hiding action buttons. It then uses <span class="tech-pill">jsPDF</span> to cleanly slice the document into standard A4 pages. On mobile devices, it integrates with the native Web Share API so users can send the PDF via WhatsApp, email, or AirDrop with one tap.</p>
+    </div>
+  </div>
+
+  <!-- Q20 -->
+  <div class="qa-card">
+    <div class="q-title"><span class="q-num">Q20.</span> How is the app packaged for Mobile Devices (Android APK &amp; iOS PWA)?</div>
+    <div class="answer-text">
+      <p><strong>Answer:</strong> For Android, the project is configured using <strong>Capacitor</strong> (<span class="tech-pill">com.guardianeye.ai</span>) with camera and microphone permissions declared in <span class="tech-pill">AndroidManifest.xml</span>, building directly into an Android APK. For iOS and desktop, it functions as a Progressive Web App (PWA) with an "Add to Home Screen" prompt for full-screen offline use.</p>
+    </div>
+  </div>
+
+  <!-- Q21 -->
+  <div class="qa-card">
+    <div class="q-title"><span class="q-num">Q21.</span> How are cloud databases and file storage secured against unauthorized access?</div>
+    <div class="answer-text">
+      <p><strong>Answer:</strong> Security is enforced at both cloud and server levels: Cloud Firestore and Firebase Storage security rules enforce strict document ownership so users can only read and write their own recordings and transcripts. On the backend, directory path traversal protection checks every file path with <span class="tech-pill">os.path.abspath</span>, preventing unauthorized <span class="tech-pill">../../</span> access with HTTP 403 Forbidden.</p>
+    </div>
+  </div>
+
+  <!-- Q22 -->
+  <div class="qa-card">
+    <div class="q-title"><span class="q-num">Q22.</span> How is the project tested and verified?</div>
+    <div class="answer-text">
+      <p><strong>Answer:</strong> The project includes four automated verification suites: <span class="tech-pill">test_production_suite.py</span> tests authentication, video extraction, and room limits; <span class="tech-pill">crosscheck_all.py</span> verifies multi-speaker clustering; <span class="tech-pill">simulation_test_suite.mjs</span> audits WebRTC network traversal and SDP constraints; and <span class="tech-pill">test_e2e_pipeline.py</span> verifies the full transcription and scoring pipeline.</p>
+    </div>
+  </div>
+
+  <!-- Q23 -->
+  <div class="qa-card">
+    <div class="q-title"><span class="q-num">Q23.</span> How does the platform scale and maintain low latency during peak usage?</div>
+    <div class="answer-text">
+      <p><strong>Answer:</strong> Peer-to-peer WebRTC mesh topology means video and audio streams flow directly between users rather than through an expensive media server. Audio extraction uses FFmpeg streaming pipes, and Groq Whisper transcribes 30-minute meetings in less than 5 seconds. Because compute runs on edge devices and high-speed Groq LPU chips, server hosting costs remain minimal.</p>
+    </div>
+  </div>
+
+  <!-- Q24 -->
+  <div class="qa-card">
+    <div class="q-title"><span class="q-num">Q24.</span> How does Guardian Eye AI handle user privacy and zero data retention?</div>
+    <div class="answer-text">
+      <p><strong>Answer:</strong> User privacy is built-in by design. Video recordings stay in the user's browser IndexedDB unless the user explicitly uploads them. Audio files processed by the backend are stored in temporary system directories that clean up automatically. Passwords are cryptographically hashed, and no private video streams are logged or stored on external servers.</p>
+    </div>
+  </div>
+
+  <!-- Q25 -->
+  <div class="qa-card">
+    <div class="q-title"><span class="q-num">Q25.</span> What is the overall business value and uniqueness of Guardian Eye AI?</div>
+    <div class="answer-text">
+      <p><strong>Answer:</strong> Traditional video meeting apps (like Zoom or Google Meet) only transmit video and audio without understanding conversation quality. Guardian Eye AI bridges communication and intelligence: it provides smooth video conferencing and acts as an AI auditor that tracks speaking speed, eliminates filler words, holds speakers accountable with question-and-answer fact-checking, and generates executive-ready performance reports.</p>
+    </div>
+  </div>
+
+</body>
+</html>
+"""
+
+
+def main():
+    print("=" * 70)
+    print("GUARDIAN EYE AI — PRESENTATION & VIVA MASTER Q&A PDF GENERATOR")
+    print("=" * 70)
+
+    # 1. Paths
+    root_dir = os.path.dirname(os.path.abspath(__file__))
+    frontend_public = os.path.join(root_dir, "frontend", "public")
+    os.makedirs(frontend_public, exist_ok=True)
+
+    pdf_root = os.path.join(root_dir, "GuardianEye_AI_Presentation_Guide.pdf")
+    pdf_public = os.path.join(frontend_public, "GuardianEye_AI_Presentation_Guide.pdf")
+
+    # 2. Write HTML template to local HTML file
+    local_html = os.path.join(root_dir, "GuardianEye_AI_Presentation_Guide.html")
+    with open(local_html, "w", encoding="utf-8") as f:
+        f.write(HTML_CONTENT)
+
+    print(f"[*] Generated HTML document at: {local_html} ({len(HTML_CONTENT)} bytes)")
+
+    # 3. Locate Chrome binary
+    chrome_bin = None
+    for cand in [
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+        shutil.which("google-chrome"),
+        shutil.which("chromium"),
+        shutil.which("chrome"),
+    ]:
+        if cand and os.path.exists(cand) and os.access(cand, os.X_OK):
+            chrome_bin = cand
+            break
+
+    if not chrome_bin:
+        print("[!] Chrome binary not found. Looking for alternative PDF generator...")
+        sys.exit(1)
+
+    print(f"[*] Using Chrome headless binary: {chrome_bin}")
+
+    temp_profile = f"/tmp/chrome-pdf-{os.getpid()}"
+    os.makedirs(temp_profile, exist_ok=True)
+
+    # 4. Run Chrome headless print to PDF
+    chrome_cmd = [
+        chrome_bin,
+        "--headless=new",
+        "--disable-gpu",
+        "--no-sandbox",
+        "--disable-crash-reporter",
+        "--crash-dumps-dir=/tmp",
+        f"--user-data-dir={temp_profile}",
+        "--no-pdf-header-footer",
+        f"--print-to-pdf={pdf_root}",
+        local_html,
+    ]
+
+    print("[*] Rendering PDF with Chrome Headless engine...")
+    res = subprocess.run(chrome_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if not os.path.exists(pdf_root) or os.path.getsize(pdf_root) < 1000:
+        err = res.stderr.decode("utf-8", errors="ignore")
+        print(f"[!] PDF rendering failed: {err[:400]}")
+        sys.exit(1)
+
+    # 5. Copy to frontend/public for direct download via browser
+    shutil.copyfile(pdf_root, pdf_public)
+
+    root_size_kb = os.path.getsize(pdf_root) / 1024
+    pub_size_kb = os.path.getsize(pdf_public) / 1024
+
+    print("[✓] SUCCESS! Master PDF generated:")
+    print(f"    1. Project Root:    {pdf_root} ({root_size_kb:.2f} KB)")
+    print(f"    2. Frontend Public: {pdf_public} ({pub_size_kb:.2f} KB)")
+    print("    3. Direct Download: http://localhost:5173/GuardianEye_AI_Presentation_Guide.pdf")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    main()

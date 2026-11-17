@@ -395,6 +395,87 @@
 .metric-bar-fill.fill-straightforward {
   background: linear-gradient(90deg, #06b6d4, #22d3ee);
 }
+.metric-bar-fill.fill-assertiveness {
+  background: linear-gradient(90deg, #ec4899, #f43f5e);
+}
+.metric-bar-fill.fill-tone-vector {
+  background: linear-gradient(90deg, #8b5cf6, #38bdf8);
+}
+.metric-bar-fill.fill-tone-vector.tone-commanding {
+  background: linear-gradient(90deg, #f59e0b, #ef4444);
+}
+.metric-bar-fill.fill-tone-vector.tone-requesting {
+  background: linear-gradient(90deg, #06b6d4, #3b82f6);
+}
+.metric-bar-fill.fill-tone-vector.tone-polite {
+  background: linear-gradient(90deg, #10b981, #34d399);
+}
+.metric-bar-fill.fill-tone-vector.tone-collaborative {
+  background: linear-gradient(90deg, #8b5cf6, #c084fc);
+}
+
+.metric-tone-badge {
+  font-size: 0.72rem;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 999px;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  background: rgba(139, 92, 246, 0.15);
+  color: #c084fc;
+  border: 1px solid rgba(139, 92, 246, 0.3);
+}
+
+.metric-tone-badge.tone-commanding {
+  background: rgba(239, 68, 68, 0.15);
+  color: #f87171;
+  border-color: rgba(239, 68, 68, 0.35);
+}
+
+.metric-tone-badge.tone-requesting {
+  background: rgba(56, 189, 248, 0.15);
+  color: #38bdf8;
+  border-color: rgba(56, 189, 248, 0.35);
+}
+
+.metric-tone-badge.tone-polite {
+  background: rgba(16, 185, 129, 0.15);
+  color: #34d399;
+  border-color: rgba(16, 185, 129, 0.35);
+}
+
+.metric-tone-badge.tone-collaborative {
+  background: rgba(139, 92, 246, 0.15);
+  color: #c084fc;
+  border-color: rgba(139, 92, 246, 0.35);
+}
+
+.telemetry-pill-tone {
+  background: rgba(139, 92, 246, 0.12);
+  color: #c084fc;
+  border: 1px solid rgba(139, 92, 246, 0.25);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.telemetry-pill-tone.tone-commanding {
+  background: rgba(239, 68, 68, 0.12);
+  color: #f87171;
+  border-color: rgba(239, 68, 68, 0.25);
+}
+
+.telemetry-pill-tone.tone-requesting {
+  background: rgba(56, 189, 248, 0.12);
+  color: #38bdf8;
+  border-color: rgba(56, 189, 248, 0.25);
+}
+
+.telemetry-pill-tone.tone-polite {
+  background: rgba(16, 185, 129, 0.12);
+  color: #34d399;
+  border-color: rgba(16, 185, 129, 0.25);
+}
 
 /* ── Section 2: Scrollable Verbatim Transcript Dialogue ── */
 .transcript-card {

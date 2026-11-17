@@ -17,6 +17,11 @@ export default defineConfig({
       '/ws': {
         target: 'ws://127.0.0.1:8000',
         ws: true,
+      },
+      '/peerjs': {
+        target: 'http://127.0.0.1:9000',
+        ws: true,
+        changeOrigin: true,
       }
     }
   }

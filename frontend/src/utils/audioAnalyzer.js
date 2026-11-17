@@ -321,31 +321,6 @@ export async function analyzeAudioClientSide(fileOrBlob, options = {}, onProgres
   }
 }
 
-function getRealisticDialogue(spkIdx, turnIdx) {
-  const dialogues = [
-    [
-      "Good morning everyone. Let's align on our sprint deliverables and architectural milestones upfront.",
-      "Building on the feedback from yesterday, we isolated the media relay pipelines so latency stays below 50 milliseconds.",
-      "Let's ensure the post-meeting analytics dashboard is verified before end of day today.",
-      "Great work team. I will distribute the executive summary and action items."
-    ],
-    [
-      "Thanks Abhishek. Our real-time WebRTC audio-video streaming SLA maintains 99.99% uptime with zero packet loss.",
-      "To answer your point regarding rollback resilience, our automated health checks trigger within 300ms.",
-      "The speech diarization models show steady convergence across both multi-party and dual-party recordings."
-    ],
-    [
-      "From the engineering side, database connection pooling is optimized and our memory usage is down by 35%.",
-      "I agree with the proposed API contracts; we should maintain backwards compatibility for client SDKs.",
-      "All unit and integration test suites are green across the automated CI pipeline."
-    ],
-    [
-      "The visual design system and contrast ratios are compliant with WCAG AAA accessibility standards.",
-      "User testing showed strong preference for the real-time active speaker layout and floating bottom progress indicators.",
-      "We've added clear visual cues for muted states, hand raising, and coach feedback cards."
-    ]
-  ];
-
-  const pool = dialogues[spkIdx] || dialogues[0];
-  return pool[turnIdx % pool.length];
+function getRealisticDialogue(_spkIdx, _turnIdx) {
+  return "[Acoustic speech detected — Connect backend or Groq API for verbatim speech-to-text]";
 }

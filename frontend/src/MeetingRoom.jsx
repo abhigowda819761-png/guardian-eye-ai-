@@ -312,7 +312,7 @@ function MeetingRoom({
   const [mediaStatus,  setMediaStatus]  = useState('loading'); // 'loading' | 'ready' | 'error'
   const [mediaError,   setMediaError]   = useState('');
   const [videoOn,      setVideoOn]      = useState(true);
-  const [audioOn,      setAudioOn]      = useState(true);
+  const [audioOn,      setAudioOn]      = useState(false);
   const [handRaised,   setHandRaised]   = useState(false);
   const [isRecording,  setIsRecording]  = useState(false);
   const [showNotes,    setShowNotes]    = useState(false);
@@ -345,7 +345,7 @@ function MeetingRoom({
   const recordingStreamRef   = useRef(null);
   const peersRef             = useRef([]);
   const videoOnRef           = useRef(true);
-  const audioOnRef           = useRef(true);
+  const audioOnRef           = useRef(false);
   const setupCallRef         = useRef(null);
 
   const [activeSpeakerId,   setActiveSpeakerId]   = useState('local');
@@ -417,7 +417,7 @@ function MeetingRoom({
     setPeers(prev => {
       const idx = prev.findIndex(p => p.id === id);
       if (idx === -1) {
-        return [...prev, { id, name: 'Peer', role: 'participant', stream: null, handRaised: false, audioOn: true, videoOn: true, ...patch }];
+        return [...prev, { id, name: 'Peer', role: 'participant', stream: null, handRaised: false, audioOn: false, videoOn: true, ...patch }];
       }
       const updated = [...prev];
       updated[idx] = { ...updated[idx], ...patch };
@@ -537,11 +537,16 @@ function MeetingRoom({
       return null;
     }
 
+    // Enforce default MUTE when entering the meeting room; user must click Unmute to speak
+    stream.getAudioTracks().forEach(track => {
+      track.enabled = false;
+    });
     streamRef.current = stream;
     setLocalStream(stream);
     setMediaStatus('ready');
     setVideoOn(videoAcquired);
-    setAudioOn(audioAcquired);
+    setAudioOn(false);
+    audioOnRef.current = false;
 
     // If active peer calls exist, dynamically replace or attach new tracks
     Object.values(callsRef.current).forEach(call => {
@@ -781,6 +786,13 @@ function MeetingRoom({
   const setupDataConnection = useCallback((conn) => {
     const peerId = conn.peer;
     dataConnsRef.current[peerId] = conn;
+
+    conn.on('open', () => {
+      try {
+        conn.send({ type: 'peer_state', key: 'audioOn', value: audioOnRef.current });
+        conn.send({ type: 'peer_state', key: 'videoOn', value: videoOnRef.current });
+      } catch (e) {}
+    });
 
     conn.on('data', (data) => {
       if (!data || !data.type) return;
@@ -1576,24 +1588,26 @@ function MeetingRoom({
             try {
               const formData = new FormData();
               formData.append('file', videoBlob, videoFilename);
-              const liveHost = hostName || auth?.currentUser?.displayName || (auth?.currentUser?.email ? auth.currentUser.email.split('@')[0] : 'ABHIGOWDA819761');
-              const activePeers = (peers || []).filter(p => p && p.name && p.name !== liveHost);
-              const guestName = activePeers.length > 0 ? activePeers[0].name : '';
+              const liveHost = (hostName && hostName.trim()) ? hostName.trim() : (auth?.currentUser?.displayName || (auth?.currentUser?.email ? auth.currentUser.email.split('@')[0] : 'Host'));
+              const activePeers = (peers || []).filter(p => p && p.name && p.name !== liveHost && p.id !== '__self__');
+              const guestNames = activePeers.map(p => p.name).slice(0, 4);
               formData.append('speaker_0', liveHost);
               formData.append('hostName', liveHost);
-              if (guestName) {
-                formData.append('speaker_1', guestName);
-                formData.append('participantNames', JSON.stringify([guestName]));
-              }
+              guestNames.forEach((gName, idx) => {
+                formData.append(`speaker_${idx + 1}`, gName);
+              });
+              formData.append('participantNames', JSON.stringify(guestNames));
               formData.append('meeting_code', meetingCode || 'MEETING');
               formData.append('meetingId', meetingCode || 'MEETING');
 
               const candidateEndpoints = [
-                `${API_BASE_URL}/api/meeting/analyze-video`,
-                `${API_BASE_URL}/api/video/diarize-transcript`,
+                '/api/meeting/analyze-video',
+                '/api/video/diarize-transcript',
+                `${API_BASE_URL ? API_BASE_URL.replace(/\/+$/, '') : ''}/api/meeting/analyze-video`,
+                `${API_BASE_URL ? API_BASE_URL.replace(/\/+$/, '') : ''}/api/video/diarize-transcript`,
+                'http://127.0.0.1:8000/api/meeting/analyze-video',
                 `http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:8000/api/meeting/analyze-video`,
                 'http://localhost:8000/api/meeting/analyze-video',
-                'http://10.102.167.95:8000/api/meeting/analyze-video',
                 'http://localhost:8000/api/video/diarize-transcript'
               ].filter((u, i, a) => u && a.indexOf(u) === i);
 
@@ -1803,6 +1817,7 @@ function MeetingRoom({
         meetingCode: meetingCode,
         duration: durationStr,
         hostName: hostName || 'Host',
+        participantNames: peersRef.current.filter(p => p.id !== '__self__' && p.name).map(p => p.name),
         participantsCount: 1 + peersRef.current.filter(p => p.id !== '__self__').length,
         isGuest: isGuest
       });

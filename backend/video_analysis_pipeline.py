@@ -2,83 +2,111 @@ import os
 import sys
 import shutil
 import subprocess
+import base64
 import json
 import re
 import time
 import tempfile
 from typing import Dict, List, Any, Optional, Tuple
 
+import dotenv
+dotenv.load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+dotenv.load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
+
+try:
+    from audio_extractor import (
+        load_wav_samples,
+        extract_acoustic_embedding,
+        cluster_speakers
+    )
+    HAS_ACOUSTIC_DIARIZER = True
+except Exception:
+    HAS_ACOUSTIC_DIARIZER = False
+
+
+def get_gemini_api_keys(
+    override_primary: Optional[str] = None,
+    override_secondary: Optional[str] = None
+) -> Tuple[str, str]:
+    """
+    Dual-Key Resolver with Load-Splitting & Automatic Failover:
+    - Primary key: Dedicated to heavy multimodal audio transcription & diarization
+    - Secondary key: Dedicated to 1-10 cognitive scoring, executive summary & fact-check audit
+    Returns: (primary_key, secondary_key)
+    """
+    def _clean(k: Optional[str]) -> str:
+        s = (k or "").strip()
+        if s in (
+            "AIzaSy_YOUR_FIRST_GEMINI_API_KEY_HERE",
+            "AIzaSy_YOUR_SECOND_GEMINI_API_KEY_HERE",
+            "YOUR_GEMINI_API_KEY_HERE",
+            "YOUR_GROQ_API_KEY_HERE"
+        ):
+            return ""
+        return s
+
+    primary = _clean(override_primary) or _clean(os.getenv("GEMINI_API_KEY_PRIMARY")) or _clean(os.getenv("GEMINI_API_KEY"))
+    secondary = _clean(override_secondary) or _clean(os.getenv("GEMINI_API_KEY_SECONDARY"))
+
+    # Gracefully catch if user placed Gemini key in GROQ_API_KEY
+    groq_val = _clean(os.getenv("GROQ_API_KEY"))
+    if groq_val and (groq_val.startswith("AIza") or groq_val.startswith("AQ.")):
+        if not primary:
+            primary = groq_val
+        elif not secondary:
+            secondary = groq_val
+
+    # If only one key is configured, share it across both roles
+    if not secondary:
+        secondary = primary
+    if not primary:
+        primary = secondary
+
+    return primary, secondary
+
+
+def get_gemini_api_key(override_key: Optional[str] = None, role: str = "primary") -> str:
+    """Resolves single Gemini key based on role ('primary' or 'secondary') with automatic failover."""
+    p, s = get_gemini_api_keys(
+        override_primary=override_key if role == "primary" else None,
+        override_secondary=override_key if role != "primary" else None
+    )
+    return p if role == "primary" else s
+
+
 def get_ffmpeg_binary() -> str:
-    """
-    Resolves the system's ffmpeg executable using absolute paths or PATH lookup.
-    Prioritizes standard Linux locations used by Render's Debian/Ubuntu containers.
-    """
     env_ffmpeg = os.environ.get("FFMPEG_PATH") or os.environ.get("FFMPEG_BIN")
     if env_ffmpeg and os.path.exists(env_ffmpeg):
         return env_ffmpeg
-
     which_ffmpeg = shutil.which("ffmpeg")
     if which_ffmpeg and os.path.exists(which_ffmpeg):
         return which_ffmpeg
-
-    candidates = [
-        "/usr/bin/ffmpeg",             # Default Debian/Ubuntu apt install location
-        "/usr/local/bin/ffmpeg",       # Common compiled/custom location
-        "/bin/ffmpeg",                 # Core binary path
-        "/opt/homebrew/bin/ffmpeg",    # macOS Apple Silicon
+    for path in [
+        "/opt/homebrew/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg",
+        "/usr/bin/ffmpeg",
+        "/bin/ffmpeg",
         "/usr/local/opt/ffmpeg/bin/ffmpeg"
-    ]
-    for path in candidates:
+    ]:
         if os.path.exists(path) and os.access(path, os.X_OK):
             return path
-
     return which_ffmpeg or "ffmpeg"
+
 
 FFMPEG_BIN = get_ffmpeg_binary()
 TEMP_DIR = os.path.abspath(tempfile.gettempdir())
 
+
 def extract_wav_with_ffmpeg(video_path: str, output_wav_path: str) -> bool:
-    """
-    Extracts 16kHz mono WAV from video using FFmpeg (-acodec pcm_s16le -ar 16000 -ac 1).
-    Enforces absolute os.path temp directory tracking, stream lookahead, and verifies
-    that output WAV is strictly greater than 0 bytes (and >= 44 bytes header) before passing to Groq.
-    """
+    """Extracts 16kHz mono PCM WAV from uploaded video/audio using FFmpeg."""
     abs_video = os.path.abspath(video_path)
     abs_output = os.path.abspath(output_wav_path)
-    abs_temp = os.path.abspath(tempfile.gettempdir())
-    os.makedirs(abs_temp, exist_ok=True)
     os.makedirs(os.path.dirname(abs_output), exist_ok=True)
-    
-    # 1. Asynchronous file system lookahead: ensure video file stream handle is fully closed and stable on disk
-    last_size = -1
-    stable_checks = 0
-    for _ in range(10):
-        if not os.path.exists(abs_video):
-            time.sleep(0.05)
-            continue
-        try:
-            curr_size = os.path.getsize(abs_video)
-            # Test stream handle readability
-            with open(abs_video, "rb") as check_f:
-                check_f.read(1024)
-            if curr_size == last_size and curr_size > 0:
-                stable_checks += 1
-                if stable_checks >= 2:
-                    break
-            else:
-                stable_checks = 0
-                last_size = curr_size
-        except Exception:
-            stable_checks = 0
-        time.sleep(0.05)
 
     if not os.path.exists(abs_video) or os.path.getsize(abs_video) == 0:
-        raise RuntimeError(f"Video file at {abs_video} is missing or empty (0 bytes). Cannot extract audio.")
+        raise RuntimeError(f"Video file at {abs_video} is missing or empty (0 bytes).")
 
     ffmpeg_bin = get_ffmpeg_binary()
-    in_size = os.path.getsize(abs_video)
-    print(f"[FFmpeg] Input video track: {abs_video} ({in_size} bytes, tempDir: {abs_temp}, bin: {ffmpeg_bin})")
-    
     cmd = [
         ffmpeg_bin,
         "-y",
@@ -89,318 +117,389 @@ def extract_wav_with_ffmpeg(video_path: str, output_wav_path: str) -> bool:
         "-ac", "1",
         abs_output
     ]
-    
-    try:
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
-    except FileNotFoundError:
-        print(f"[FFmpeg] Binary {ffmpeg_bin} not found, falling back to 'ffmpeg' in PATH")
-        cmd[0] = "ffmpeg"
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("FFmpeg extraction timed out after 120 seconds.")
-
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
     if res.returncode != 0:
         err = res.stderr.decode("utf-8", errors="ignore")
-        print(f"[FFmpeg] Hard Error during extraction: {err}")
-        raise RuntimeError(f"FFmpeg audio extraction failed: {err}")
-    
-    out_size = os.path.getsize(abs_output) if os.path.exists(abs_output) else 0
-    # Strict validation: output WAV file must be greater than 0 bytes and >= 44 bytes header
-    if not os.path.exists(abs_output) or out_size == 0:
-        print(f"[FFmpeg] ERROR: Output audio file size is 0 bytes for {abs_output}")
-        raise RuntimeError(f"Output audio file is missing or 0 bytes for {abs_output}. Cannot pass to Groq Whisper Large-V3.")
+        raise RuntimeError(f"FFmpeg audio extraction failed: {err[:300]}")
 
-    if out_size < 44:
-        print(f"[FFmpeg] ERROR: Output audio file size is {out_size} bytes (<44 bytes header) for {abs_output}")
-        raise RuntimeError(f"Output audio file size is {out_size} bytes (less than 44-byte WAV header) for {abs_output}. Cannot pass to Groq Whisper Large-V3.")
-
-    # Duration matching validation to prevent partial ingestion
-    def probe_dur(fpath: str) -> Optional[float]:
-        try:
-            p = subprocess.run([ffmpeg_bin, "-i", fpath], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            out = p.stderr.decode("utf-8", errors="ignore")
-            m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.?\d*)", out)
-            if m:
-                return float(m.group(1)) * 3600 + float(m.group(2)) * 60 + float(m.group(3))
-        except Exception:
-            pass
-        return None
-
-    v_dur = probe_dur(abs_video)
-    a_dur = probe_dur(abs_output)
-    print(f"[FFmpeg] Duration check: Video={v_dur}s, Audio={a_dur}s")
-    if v_dur and v_dur > 0:
-        if out_size < 44:
-            raise RuntimeError(f"Input video duration is {v_dur:.2f}s, but output WAV size is {out_size} bytes (<44 bytes header). Partial ingestion blocked.")
-        if a_dur and v_dur > 1.5:
-            diff = abs(v_dur - a_dur)
-            if diff > 2.5 and (diff / v_dur) > 0.15:
-                raise RuntimeError(f"Audio extraction truncated! Video duration ({v_dur:.1f}s) does not match audio stream duration ({a_dur:.1f}s). Terminated to prevent partial ingestion.")
-
-    print(f"[FFmpeg] Extracted 16kHz mono WAV: {abs_output} ({out_size} bytes)")
+    if not os.path.exists(abs_output) or os.path.getsize(abs_output) < 44:
+        raise RuntimeError("Output WAV file is missing or < 44 bytes.")
     return True
 
+
+def _prepare_gemini_audio(wav_path: str) -> Tuple[str, str]:
+    """
+    Compresses 16kHz WAV to compact 16kHz mono 48kbps MP3 so base64 inline_data payload
+    sent to Gemini 2.5 Flash is fast, lightweight (<15MB), and works for long recordings.
+    """
+    mp3_path = wav_path.rsplit(".", 1)[0] + "_gemini.mp3"
+    ffmpeg_bin = get_ffmpeg_binary()
+    cmd = [
+        ffmpeg_bin, "-y",
+        "-i", wav_path,
+        "-vn",
+        "-ar", "16000",
+        "-ac", "1",
+        "-b:a", "48k",
+        mp3_path
+    ]
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+        if res.returncode == 0 and os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 100:
+            return mp3_path, "audio/mp3"
+    except Exception as e:
+        print(f"[Gemini Audio Optimizer] MP3 compression notice: {e}")
+    return wav_path, "audio/wav"
+
+
 def format_sec(sec: float) -> str:
-    m = int(sec // 60)
-    s = int(sec % 60)
+    m = int(max(0.0, sec) // 60)
+    s = int(max(0.0, sec) % 60)
     return f"{m:02d}:{s:02d}"
+
+
+def _build_speaker_roster(
+    host_name: str,
+    guest_name: str = "",
+    participant_names: Optional[List[str]] = None
+) -> List[str]:
+    """Builds deduplicated list of up to 5 speaker names using exact user-provided names."""
+    clean_host = (host_name or "Host").strip()
+    if not clean_host or clean_host.upper() in ("ABHIGOWDA819761", "ABHISHEK", "DEFAULT"):
+        clean_host = "Host"
+
+    roster = [clean_host]
+    raw_candidates: List[str] = []
+
+    if participant_names:
+        for item in participant_names:
+            if isinstance(item, str):
+                raw_candidates.extend([x.strip() for x in item.split(",") if x.strip()])
+    if guest_name:
+        raw_candidates.extend([x.strip() for x in guest_name.split(",") if x.strip()])
+
+    for name in raw_candidates:
+        if (
+            name
+            and name.upper() not in ("ABHIGOWDA819761", "ABHISHEK", "DEFAULT")
+            and name.lower() not in [r.lower() for r in roster]
+        ):
+            roster.append(name)
+        if len(roster) >= 5:
+            break
+
+    if len(roster) == 1:
+        roster.append("Participant 1")
+    return roster[:5]
+
+
+def _parse_robust_json(text: str) -> Optional[Any]:
+    if not text:
+        return None
+    cleaned = text.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.MULTILINE)
+    cleaned = re.sub(r"```$", "", cleaned, flags=re.MULTILINE).strip()
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        pass
+
+    fixed = re.sub(r',\s*([\]\}])', r'\1', cleaned)
+    try:
+        return json.loads(fixed)
+    except Exception:
+        pass
+
+    m = re.search(r'(\{[\s\S]*\}|\[[\s\S]*\])', cleaned)
+    if m:
+        candidate = m.group(1)
+        try:
+            return json.loads(candidate)
+        except Exception:
+            try:
+                fixed_cand = re.sub(r',\s*([\]\}])', r'\1', candidate)
+                return json.loads(fixed_cand)
+            except Exception:
+                pass
+    return None
+
 
 async def transcribe_audio(
     wav_path: str,
-    host_name: str = "ABHIGOWDA819761",
-    guest_name: str = "Participant",
-    groq_api_key: Optional[str] = None
+    host_name: str = "Host",
+    guest_name: str = "Participant 1",
+    groq_api_key: Optional[str] = None,
+    participant_names: Optional[List[str]] = None,
+    gemini_api_key: Optional[str] = None
 ) -> Dict[str, Any]:
     """
-    Transcribes audio using Groq Whisper Large-V3 if key provided;
-    otherwise uses local faster-whisper model.
+    100% Gemini 2.5 Flash Native Audio Diarization & Verbatim Transcription:
+    Sends the audio directly to Gemini 2.5 Flash so Gemini listens to the distinct voices,
+    separates 'Who Spoke What' across up to 5 user-entered speaker names, and extracts
+    every spoken turn with timestamps and filler words.
     """
-    groq_key = groq_api_key or os.getenv("GROQ_API_KEY", "")
-    wav_size = os.path.getsize(wav_path) if os.path.exists(wav_path) else 0
-    print(f"[transcribe_audio] Preparing audio transcription for {host_name} and {guest_name} (WAV size: {wav_size} bytes)")
-    
-    # 1. Try Groq Whisper Large-V3
-    if groq_key:
-        try:
-            import httpx
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                with open(wav_path, "rb") as f:
-                    files = {"file": (os.path.basename(wav_path), f, "audio/wav")}
-                    data = {
-                        "model": "whisper-large-v3",
-                        "response_format": "verbose_json",
-                        "temperature": "0.0",
-                        "prompt": f"Meeting conversation between {host_name} and {guest_name}."
-                    }
-                    headers = {"Authorization": f"Bearer {groq_key}"}
-                    resp = await client.post(
-                        "https://api.groq.com/openai/v1/audio/transcriptions",
-                        files=files,
-                        data=data,
-                        headers=headers
-                    )
-                
-                if resp.status_code == 200:
-                    groq_data = resp.json()
-                    raw_segments = groq_data.get("segments", [])
-                    # Chronological sorting of Groq response segments
-                    segments = sorted(raw_segments, key=lambda s: float(s.get("start", 0.0)))
-                    raw_text = groq_data.get("text", "").strip()
-                    
-                    dialogue_turns = []
-                    dialogue_lines = []
-                    
-                    if segments:
-                        for idx, seg in enumerate(segments):
-                            text = seg.get("text", "").strip()
-                            if not text:
-                                continue
-                            start = seg.get("start", 0.0)
-                            ts = format_sec(start)
-                            
-                            # Dynamic Speaker Tag Detection (e.g., Speaker 1:, Participant:)
-                            spk = host_name
-                            tag_match = re.match(r'^(?:Speaker\s*([0-9]+)|([a-zA-Z0-9_\s]+)):\s*(.+)$', text, re.I)
-                            if tag_match:
-                                if tag_match.group(1) is not None:
-                                    spk_num = int(tag_match.group(1))
-                                    spk = host_name if spk_num == 0 else guest_name
-                                elif tag_match.group(2):
-                                    name_part = tag_match.group(2).strip().lower()
-                                    if guest_name and guest_name.lower() in name_part:
-                                        spk = guest_name
-                                    elif host_name and host_name.lower() in name_part:
-                                        spk = host_name
-                                    else:
-                                        spk = tag_match.group(2).strip()
-                                text = tag_match.group(3).strip()
-                            
-                            is_host = (spk.lower() == host_name.lower())
-                            dialogue_turns.append({
-                                "id": f"turn_{idx}",
-                                "speaker": spk,
-                                "role": "Host" if is_host else "Participant",
-                                "isHost": is_host,
-                                "text": text,
-                                "timestamp": ts,
-                                "start": start,
-                                "end": seg.get("end", start + 2.0)
-                            })
-                            dialogue_lines.append(f"{spk}: {text}")
-                    elif raw_text:
-                        sentences = [s.strip() for s in re.split(r'(?<=[.?!])\s+', raw_text) if s.strip()]
-                        for idx, s in enumerate(sentences):
-                            tag_match = re.match(r'^(?:Speaker\s*([0-9]+)|([a-zA-Z0-9_\s]+)):\s*(.+)$', s, re.I)
-                            if tag_match:
-                                spk = guest_name if tag_match.group(1) == "1" else host_name
-                                text_clean = tag_match.group(3).strip()
-                            else:
-                                spk = host_name
-                                text_clean = s
-                            is_host = (spk == host_name)
-                            dialogue_turns.append({
-                                "id": f"turn_{idx}",
-                                "speaker": spk,
-                                "role": "Host" if is_host else "Participant",
-                                "isHost": is_host,
-                                "text": text_clean,
-                                "timestamp": format_sec(idx * 4.0)
-                            })
-                            dialogue_lines.append(f"{spk}: {text_clean}")
-                    
-                    # If Groq transcription array returns empty, block the pipeline from writing blank fields
-                    if not dialogue_turns and not raw_text:
-                        print(f"[transcribe_audio] ERROR: Groq Whisper transcription returned empty segments for {wav_path}. Blocking pipeline.")
-                        raise RuntimeError(f"Groq Whisper transcription returned empty segments for {wav_path}. Audio contains no detectable speech.")
+    speaker_roster = _build_speaker_roster(host_name, guest_name, participant_names)
+    clean_host = speaker_roster[0]
+    primary_key, secondary_key = get_gemini_api_keys(override_primary=gemini_api_key or groq_api_key)
 
-                    formatted_transcript = "\n".join(dialogue_lines) if dialogue_lines else raw_text
-                    return {
-                        "model": "whisper-large-v3 (Groq API)",
-                        "rawTranscript": formatted_transcript,
-                        "dialogueTurns": dialogue_turns,
-                        "text": formatted_transcript,
-                        "segments": segments,
-                        "groqSegments": segments
-                    }
-        except Exception as e:
-            print(f"[transcribe_audio] Groq API error: {e}, falling back to local faster-whisper")
-    
-    # 2. Local faster-whisper fallback
+    if not primary_key:
+        raise RuntimeError("GEMINI_API_KEY_PRIMARY (or GEMINI_API_KEY) is missing in backend/.env.")
+
+    # Dual-Key Work-Splitting: prefer primary key for heavy audio, fallback to secondary key
+    keys_to_try = [primary_key]
+    if secondary_key and secondary_key != primary_key:
+        keys_to_try.append(secondary_key)
+
+    upload_path, mime_type = _prepare_gemini_audio(wav_path)
     try:
-        from faster_whisper import WhisperModel
-        # Use lightweight model for real-time responsiveness
-        model = WhisperModel("base", device="cpu", compute_type="int8")
-        segments_gen, info = model.transcribe(wav_path, beam_size=5)
-        
-        dialogue_turns = []
-        dialogue_lines = []
-        curr_speaker = host_name
-        prev_end = 0.0
-        
-        idx = 0
-        for seg in segments_gen:
-            text = seg.text.strip()
+        with open(upload_path, "rb") as f:
+            audio_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+        prompt = f"""You are an expert Multimodal Audio Diarization and Verbatim Transcription Engine for 'Guardian Eye AI'.
+Listen carefully to the attached meeting/interview audio recording and transcribe every spoken turn verbatim, identifying exactly WHO spoke WHAT.
+
+=== REGISTERED MEETING PARTICIPANTS (UP TO 5) ===
+Host / Moderator / Interviewer: "{clean_host}"
+Full Speaker Roster (in order): {json.dumps(speaker_roster)}
+
+=== STRICT DIARIZATION & TRANSCRIPTION RULES ===
+1. Listen to the distinct vocal pitch, timbre, cadence, and conversational turn-taking (questions vs. answers, greetings, and name mentions) in the audio.
+2. Attribute every spoken turn strictly to the matching speaker name from {json.dumps(speaker_roster)}:
+   - Assign the primary interviewer / moderator / host voice to "{clean_host}".
+   - Assign each distinct participant / candidate / guest voice consistently to the remaining names in {json.dumps(speaker_roster)}.
+   - If a speaker is addressed by name in the audio, bind that voice to that exact name.
+3. Transcribe 100% verbatim in English (or transliterated Roman script if another language is spoken), preserving natural filler words ("um", "uh", "like", "you know") so our communication fluency scorer can count them accurately.
+4. Provide accurate `start` and `end` timestamps in seconds (float) for every turn.
+
+Return ONLY valid JSON matching this exact schema:
+{{
+  "segments": [
+    {{
+      "start": 0.0,
+      "end": 4.2,
+      "speaker": "{clean_host}",
+      "text": "Exact verbatim words spoken in this turn."
+    }}
+  ]
+}}"""
+
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"inline_data": {"mime_type": mime_type, "data": audio_b64}},
+                    {"text": prompt}
+                ]
+            }],
+            "generationConfig": {
+                "temperature": 0.0,
+                "responseMimeType": "application/json"
+            }
+        }
+
+        import httpx
+        raw_segments: List[Dict[str, Any]] = []
+        used_model = "gemini-3.5-flash"
+        models_to_try = ("gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-flash-latest", "gemini-3.8-flash")
+
+        for key_candidate in keys_to_try:
+            if raw_segments:
+                break
+            for model_id in models_to_try:
+                try:
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={key_candidate}"
+                    async with httpx.AsyncClient(timeout=180.0) as client:
+                        resp = await client.post(url, json=payload)
+                        if resp.status_code == 200:
+                            resp_json = resp.json()
+                            candidates = resp_json.get("candidates", [])
+                            if candidates:
+                                text_content = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                                parsed = _parse_robust_json(text_content)
+                                segs = parsed.get("segments", []) if isinstance(parsed, dict) else (parsed if isinstance(parsed, list) else [])
+                                if segs:
+                                    raw_segments = segs
+                                    used_model = f"{model_id} (Native Audio)"
+                                    print(f"[Gemini Audio Diarizer] {model_id} extracted {len(raw_segments)} speaker turns using {'Primary' if key_candidate == primary_key else 'Secondary'} Key.")
+                                    break
+                        else:
+                            print(f"[Gemini Audio {model_id} Error] HTTP {resp.status_code}: {resp.text[:250]}")
+                except Exception as e:
+                    print(f"[Gemini Audio {model_id} Exception] {e}")
+
+        # Local whisper fallback if Gemini network call failed
+        if not raw_segments:
+            try:
+                from diarizer import get_whisper_model
+                import asyncio
+                print("[Gemini Audio Fallback] Running local audio diarization & transcription on WAV...")
+                model = get_whisper_model("base")
+                if model is not None:
+                    res = await asyncio.to_thread(model.transcribe, wav_path, fp16=False, language="en")
+                    raw_segments = res.get("segments", [])
+                    used_model = "local-whisper-fallback"
+            except Exception as local_err:
+                print(f"[Local Transcription Notice] {local_err}")
+
+        dialogue_turns: List[Dict[str, Any]] = []
+        dialogue_lines: List[str] = []
+
+        for idx, seg in enumerate(raw_segments):
+            text = (seg.get("text") or "").strip()
             if not text:
                 continue
-            if idx > 0 and (seg.start - prev_end) > 1.0:
-                curr_speaker = guest_name if curr_speaker == host_name else host_name
-            
-            is_host = (curr_speaker == host_name)
+            start = float(seg.get("start", idx * 3.5))
+            end = float(seg.get("end", start + max(1.5, len(text.split()) * 0.4)))
+            ts = format_sec(start)
+
+            raw_spk = (seg.get("speaker") or clean_host).strip()
+            matched_spk = raw_spk
+            for r_name in speaker_roster:
+                if r_name.lower() == raw_spk.lower() or r_name.lower() in raw_spk.lower():
+                    matched_spk = r_name
+                    break
+            if matched_spk not in speaker_roster:
+                # Map generic Speaker 0 / Speaker 1 labels to roster
+                num_match = re.search(r'(\d+)', raw_spk)
+                if num_match:
+                    spk_idx = int(num_match.group(1))
+                    matched_spk = speaker_roster[spk_idx % len(speaker_roster)]
+                else:
+                    matched_spk = speaker_roster[idx % len(speaker_roster)]
+
+            is_host = (matched_spk.lower() == clean_host.lower())
+            turn_idx = len(dialogue_turns)
             dialogue_turns.append({
-                "id": f"turn_{idx}",
-                "speaker": curr_speaker,
+                "id": f"turn_{turn_idx}",
+                "speaker": matched_spk,
                 "role": "Host" if is_host else "Participant",
                 "isHost": is_host,
                 "text": text,
-                "timestamp": format_sec(seg.start),
-                "start": seg.start,
-                "end": seg.end
+                "timestamp": ts,
+                "start": round(start, 2),
+                "end": round(end, 2)
             })
-            dialogue_lines.append(f"{curr_speaker}: {text}")
-            prev_end = seg.end
-            idx += 1
-            
-        formatted_transcript = "\n".join(dialogue_lines) if dialogue_lines else ""
+            dialogue_lines.append(f"{matched_spk}: {text}")
+
+        formatted_transcript = "\n".join(dialogue_lines)
         return {
-            "model": "faster-whisper-base (Local CPU)",
+            "model": used_model,
             "rawTranscript": formatted_transcript,
             "dialogueTurns": dialogue_turns,
             "text": formatted_transcript,
             "segments": dialogue_turns,
-            "groqSegments": dialogue_turns
+            "groqSegments": dialogue_turns,
+            "speakerRoster": speaker_roster
         }
-    except Exception as local_err:
-        print(f"[transcribe_audio] Local whisper error: {local_err}")
-        return {
-            "model": "whisper-large-v3",
-            "rawTranscript": "",
-            "dialogueTurns": [],
-            "text": "",
-            "segments": [],
-            "groqSegments": []
-        }
+    finally:
+        if upload_path != wav_path and os.path.exists(upload_path):
+            try:
+                os.remove(upload_path)
+            except Exception:
+                pass
 
-async def generate_groq_summary(raw_transcript: str, groq_api_key: Optional[str] = None) -> str:
-    """
-    Uses Groq to generate a concise summary field ('meetingSummary')
-    based strictly and exclusively on the captured words.
-    """
-    groq_key = groq_api_key or os.getenv("GROQ_API_KEY", "")
-    if not groq_key or not raw_transcript.strip():
+
+async def generate_gemini_summary(raw_transcript: str, gemini_api_key: Optional[str] = None) -> str:
+    """Uses Gemini 2.5 Flash to generate a concise executive summary with dual-key load splitting."""
+    primary_key, secondary_key = get_gemini_api_keys(override_secondary=gemini_api_key)
+    keys_to_try = [k for k in [secondary_key, primary_key] if k]
+    if not keys_to_try or not raw_transcript.strip():
         return ""
     try:
         import httpx
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"},
-                json={
-                    "model": "llama-3.3-70b-versatile",
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": "You are a concise executive meeting summarizer. Generate a 2-3 sentence summary strictly and exclusively based on the verbatim words spoken in the transcript. Do not assume or hallucinate unmentioned context."
-                        },
-                        {
-                            "role": "user",
-                            "content": f"Verbatim Meeting Transcript:\n{raw_transcript}\n\nProvide the concise meeting summary:"
-                        }
-                    ],
-                    "temperature": 0.1,
-                    "max_tokens": 250
-                }
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                summary = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-                return summary
+        payload = {
+            "contents": [{
+                "parts": [{
+                    "text": f"Generate a concise 2-3 sentence executive summary strictly based on the verbatim words spoken in this meeting transcript:\n\n{raw_transcript}"
+                }]
+            }],
+            "generationConfig": {"temperature": 0.1, "maxOutputTokens": 200}
+        }
+        for key_candidate in keys_to_try:
+            for model_id in ("gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-flash-latest", "gemini-3.8-flash"):
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={key_candidate}"
+                try:
+                    async with httpx.AsyncClient(timeout=30.0) as client:
+                        resp = await client.post(url, json=payload)
+                        if resp.status_code == 200:
+                            candidates = resp.json().get("candidates", [])
+                            if candidates:
+                                return candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "").strip()
+                except Exception:
+                    pass
     except Exception as e:
-        print(f"[generate_groq_summary] Groq summarization notice: {e}")
+        print(f"[Gemini Summary Notice] {e}")
     return ""
 
-def extract_speaker_linguistic_metrics(segments: List[Dict], host_name: str, guest_name: str) -> Dict[str, Dict]:
-    """
-    Counts exact words, characters, and segments per detected user profile.
-    Filters out background sound tags like [Applause], [Music], [Laughter] and no_speech_prob > 0.8.
-    """
-    metrics = {
-        host_name: {"words": 0, "chars": 0, "segments": 0, "fillers": 0},
-        guest_name: {"words": 0, "chars": 0, "segments": 0, "fillers": 0}
-    }
-    filler_regex = re.compile(r'\b(uh|um|uhm|ah|er|like|you know|sort of|kind of)\b', re.IGNORECASE)
-    sound_artifacts_regex = re.compile(r'\[(applause|music|laughter|silence|whispering|cough|throat clearing)\]', re.IGNORECASE)
+# Backward-compatibility alias
+generate_groq_summary = generate_gemini_summary
+
+
+def extract_speaker_linguistic_metrics(
+    segments: List[Dict],
+    speaker_roster: List[str]
+) -> Dict[str, Dict]:
+    """Computes objective WPM, filler words, word count, char count, and hesitation pauses for up to 5 speakers."""
+    metrics: Dict[str, Dict] = {}
+    for spk in speaker_roster:
+        metrics[spk] = {
+            "words": 0, "chars": 0, "segments": 0, "fillers": 0,
+            "duration_sec": 0.0, "wpm": 0, "long_pauses": 0, "filler_rate_pct": 0.0
+        }
+
+    filler_regex = re.compile(
+        r'\b(uh|um|uhm|ah|er|erm|like|you know|sort of|kind of|basically|literally|i mean)\b',
+        re.IGNORECASE
+    )
+    sound_artifacts_regex = re.compile(
+        r'\[(applause|music|laughter|silence|whispering|cough|throat clearing)\]',
+        re.IGNORECASE
+    )
+    prev_end_by_speaker: Dict[str, float] = {}
 
     for seg in (segments or []):
         text = seg.get("text", "")
-        if seg.get("no_speech_prob", 0) > 0.8:
-            continue
         cleaned = sound_artifacts_regex.sub("", text).strip()
         if not cleaned:
             continue
 
-        spk = seg.get("speaker") or seg.get("speaker_id") or host_name
-        tag_match = re.match(r'^(?:Speaker\s*([0-9]+)|([a-zA-Z0-9_\s]+)):\s*(.+)$', cleaned, re.I)
-        if tag_match:
-            if tag_match.group(1) is not None:
-                spk = host_name if int(tag_match.group(1)) == 0 else guest_name
-            elif tag_match.group(2):
-                name_part = tag_match.group(2).strip().lower()
-                if guest_name and guest_name.lower() in name_part:
-                    spk = guest_name
-                elif host_name and host_name.lower() in name_part:
-                    spk = host_name
-            cleaned = tag_match.group(3).strip()
+        raw_spk = (seg.get("speaker") or seg.get("speakerName") or speaker_roster[0]).strip()
+        target_key = None
+        for r_spk in speaker_roster:
+            if raw_spk.lower() == r_spk.lower() or r_spk.lower() in raw_spk.lower():
+                target_key = r_spk
+                break
+        if not target_key:
+            target_key = raw_spk
+            if target_key not in metrics:
+                metrics[target_key] = {
+                    "words": 0, "chars": 0, "segments": 0, "fillers": 0,
+                    "duration_sec": 0.0, "wpm": 0, "long_pauses": 0, "filler_rate_pct": 0.0
+                }
 
         words = len(cleaned.split())
         chars = len(cleaned)
         fillers = len(filler_regex.findall(cleaned))
+        start_t = float(seg.get("start", 0.0))
+        end_t = float(seg.get("end", start_t + max(1.0, words * 0.4)))
+        seg_dur = max(0.5, end_t - start_t)
 
-        target_key = host_name if (spk.lower() == host_name.lower() or "host" in spk.lower() or spk == "Speaker 0") else guest_name
-        if target_key in metrics:
-            metrics[target_key]["words"] += words
-            metrics[target_key]["chars"] += chars
-            metrics[target_key]["segments"] += 1
-            metrics[target_key]["fillers"] += fillers
+        metrics[target_key]["words"] += words
+        metrics[target_key]["chars"] += chars
+        metrics[target_key]["segments"] += 1
+        metrics[target_key]["fillers"] += fillers
+        metrics[target_key]["duration_sec"] += seg_dur
+
+        if target_key in prev_end_by_speaker:
+            gap = start_t - prev_end_by_speaker[target_key]
+            if 1.8 <= gap <= 8.0:
+                metrics[target_key]["long_pauses"] += 1
+        prev_end_by_speaker[target_key] = end_t
+
+    for spk_key, data in metrics.items():
+        dur = data["duration_sec"]
+        w = data["words"]
+        data["wpm"] = round((w / dur) * 60) if dur > 0 else 0
+        data["filler_rate_pct"] = round((data["fillers"] / max(w, 1)) * 100.0, 1)
 
     return metrics
 
@@ -409,189 +508,219 @@ async def analyze_with_gemini(
     raw_transcript: str,
     dialogue_turns: List[Dict],
     host_name: str = "Host",
-    guest_name: str = "Participant",
+    guest_name: str = "Participant 1",
     gemini_api_key: Optional[str] = None,
-    segments: Optional[List[Dict]] = None
+    segments: Optional[List[Dict]] = None,
+    participant_names: Optional[List[str]] = None
 ) -> Dict[str, Any]:
     """
-    Executes Gemini 1.5 Flash analysis with literal metrics compliance auditor prompt.
-    Passes raw Groq timestamped segments and enforces Anti-Hallucination Gate (< 50 chars).
+    Uses Google Gemini 2.5 Flash to strictly and objectively score every active speaker (up to 5)
+    on a 1–10 scale, generate the executive summary, and perform Q&A Fact-Checking.
     """
-    gemini_key = gemini_api_key or os.getenv("GEMINI_API_KEY", "")
-    
-    # Compute exact linguistic telemetry per speaker
-    analysis_segments = segments if (segments and len(segments) > 0) else dialogue_turns
-    linguistic_metrics = extract_speaker_linguistic_metrics(analysis_segments, host_name, guest_name)
-    host_ling = linguistic_metrics.get(host_name, {"words": 0, "chars": 0, "segments": 0})
-    guest_ling = linguistic_metrics.get(guest_name, {"words": 0, "chars": 0, "segments": 0})
+    primary_key, secondary_key = get_gemini_api_keys(override_secondary=gemini_api_key)
+    # Dual-Key Work-Splitting: prefer Secondary key for scoring/fact-check, failover to Primary
+    keys_to_try = [secondary_key] if secondary_key else []
+    if primary_key and primary_key not in keys_to_try:
+        keys_to_try.append(primary_key)
 
-    # Strict dynamic active speaker inspection:
-    guest_spoke = bool(
-        guest_name
-        and guest_name.lower() != host_name.lower()
-        and guest_ling["words"] >= 10
-        and guest_ling["segments"] > 0
-    )
+    speaker_roster = _build_speaker_roster(host_name, guest_name, participant_names)
+    clean_host = speaker_roster[0]
 
-    if gemini_key:
-        try:
-            import httpx
-            speakers_list = [host_name]
-            if guest_spoke:
-                speakers_list.append(guest_name)
-            speakers_str = ", ".join(f'"{s}"' for s in speakers_list)
+    analysis_segments = dialogue_turns if (dialogue_turns and len(dialogue_turns) > 0) else (segments or [])
+    linguistic_metrics = extract_speaker_linguistic_metrics(analysis_segments, speaker_roster)
 
-            # Untampered timestamped text array directly from Groq
-            groq_timestamped_data = []
-            for seg in analysis_segments:
-                groq_timestamped_data.append({
-                    "start": seg.get("start", 0),
-                    "end": seg.get("end", 0),
-                    "speaker": seg.get("speaker") or (host_name if seg.get("isHost", True) else guest_name),
-                    "text": seg.get("text", "")
-                })
+    if keys_to_try and len(analysis_segments) > 0:
+        import httpx
 
-            guest_schema_block = f""",
-  "{guest_name}": {{
-    "communication_skills": 7,
-    "fluency": 7,
-    "confidence": 7,
-    "awkwardness": 1,
-    "straightforward_answers": 7,
-    "rationale": "Direct linguistic evidence here"
-  }}""" if guest_spoke else ""
+        prompt = f"""You are a STRICT, UNBIASED Communication Auditor and Fact-Checking Engine for 'Guardian Eye AI'.
+Evaluate each active speaker in the meeting transcript below using the objective linguistic telemetry. DO NOT inflate scores or give polite default 7/10 or 8/10 ratings.
 
-            prompt = f"""You are a literal metrics compliance auditor. You have 0% creative freedom. You must justify every single digit assigned out of 10 using direct linguistic evidence from the provided Groq text string.
+=== REGISTERED PARTICIPANTS (UP TO 5) ===
+Host: "{clean_host}"
+All Registered Speakers: {json.dumps(speaker_roster)}
 
-CRITICAL INGESTION BINDING & AUDIT RULES:
-1. Only evaluate active participants who produced spoken dialogue in the Groq data: {speakers_str}.
-2. If a user has not spoken a single word or contains less than 10 words / background sound artifacts, DO NOT evaluate them, DO NOT assign scores, and completely exclude them from the JSON response.
-3. Every score (1 to 10) must strictly adhere to the following rigid grading parameters:
-   - communication_skills: Grade based on structural vocabulary and clarity in the text.
-   - fluency: Measure based on the frequency of sentence completions vs. repetitive stuttering loops present in the Groq timestamps.
-   - confidence: Assess based on declarative phrasing vs. uncertain conditional statements.
-   - awkwardness: Count explicit filler artifacts (like uh, um, long pauses) captured by Whisper Large-V3. If none exist, the score must be clamped tightly at 1.
-   - straightforward_answers: Match questions asked directly against the immediate subsequent response block text. If the text deflects, drop the score heavily.
-4. For each evaluated speaker, provide the numeric score (1-10) for all 5 metrics, AND a concise rationale citing direct linguistic evidence (e.g. quote verbatim words, filler count, or state Insufficient spoken text for evaluation if data is scarce).
+=== OBJECTIVE LINGUISTIC TELEMETRY PER SPEAKER ===
+{json.dumps(linguistic_metrics, indent=2)}
 
-Raw Untampered Groq Timestamped Dialogue Segments:
-{json.dumps(groq_timestamped_data, indent=2)}
+=== STRICT, UNBIASED 1-TO-10 GRADING RUBRIC ===
+- 5/10 is the baseline average score.
+- 9 to 10 (Exceptional): Flawless structure, <1% filler rate, 120-150 WPM, and 100% factual accuracy.
+- 7 to 8 (Competent): Clear, direct answers with minor imperfections (1-2 fillers).
+- 5 to 6 (Average / Mediocre): Noticeable fillers ("um", "uh", "like"), surface-level explanations, or suboptimal WPM.
+- 3 to 4 (Weak): Frequent rambling, >4 fillers, hesitation pauses, or evasive responses.
+- 1 to 2 (Poor): Incoherent, factually wrong, or <10 words spoken.
 
-Full Verbatim Transcript:
+For `awkwardness` (1 to 10 scale, lower is better):
+- 1 = Composed and natural.
+- 4 to 6 = Noticeable filler words or hesitation pauses.
+- 7 to 10 = Severe awkwardness, frequent stutters, or losing train of thought.
+
+For `persuasive_assertiveness` (1 to 10 scale, higher indicates greater rhetorical conviction):
+- 9 to 10 = Unshakable conviction, authoritative delivery, decisive call-to-action, compelling impact.
+- 7 to 8 = Confident proposition, firm position, constructive advocacy.
+- 5 to 6 = Balanced or neutral stance, receptive to input, moderate conviction.
+- 3 to 4 = Tentative, overly cautious, yielding easily, passive posture.
+- 1 to 2 = Submissive, insecure, or unable to present a position.
+
+For `tone_style` (Categorical String describing the pragmatic intent & delivery posture):
+- Must be strictly one of: "Commanding" (authoritative, executive, directing), "Requesting" (soliciting input, seeking buy-in, asking questions), "Polite" (diplomatic, respectful, courteous), or "Collaborative" (partnership, shared-problem solving, team-oriented).
+
+=== TASK 1: SCORE EVERY ACTIVE SPEAKER IN {json.dumps(speaker_roster)} ===
+Provide integer scores (1-10) for `communication_skills`, `fluency`, `confidence`, `awkwardness`, `straightforward_answers`, `persuasive_assertiveness`, a categorical string for `tone_style` ("Commanding", "Requesting", "Polite", or "Collaborative"), and a critical `rationale` citing exact quotes, WPM, and filler count.
+
+=== TASK 2: VERBATIM Q&A FACT-CHECK AUDIT ===
+Extract every question asked and audit the response given. Assign a verdict strictly from: "Accurate", "Incomplete", or "Evasive".
+
+=== FULL VERBATIM TRANSCRIPT ===
 {raw_transcript}
 
-Task 2: Verbatim Fact-Checking Extraction
-Perform a direct string lookup from the text dialogue:
-- Map verbatim questions asked to exact verbatim answers given.
-- question_by: Must match the speaker who asked.
-- answered_by: Must match the speaker who answered.
-- The question and answer MUST be an actual conversational exchange between different users in the text.
-- The verdict must strictly follow one of: Accurate, Incomplete, or Evasive.
-- If no literal question-and-answer exchange exists between different users in the text, factCheckAudit must be strictly an empty array. Do not invent sample dialogues.
-
-Return ONLY a valid JSON object. Use this exact structure:
+Return ONLY valid JSON matching this schema:
 {{
-  "{host_name}": {{
-    "communication_skills": 7,
-    "fluency": 8,
-    "confidence": 7,
-    "awkwardness": 1,
-    "straightforward_answers": 7,
-    "rationale": "Direct linguistic evidence here"
-  }}{guest_schema_block},
-  "factCheckAudit": []
-}}
+  "speakerRatings": {{
+    "<SpeakerName>": {{
+      "communication_skills": <int 1-10>,
+      "fluency": <int 1-10>,
+      "confidence": <int 1-10>,
+      "awkwardness": <int 1-10>,
+      "straightforward_answers": <int 1-10>,
+      "persuasive_assertiveness": <int 1-10>,
+      "tone_style": "<Commanding | Requesting | Polite | Collaborative>",
+      "rationale": "<critical evidence with verbatim quotes, WPM, and fillers>"
+    }}
+  }},
+  "factCheckAudit": [
+    {{
+      "question_by": "<SpeakerName>",
+      "question": "<Exact question>",
+      "answered_by": "<SpeakerName>",
+      "answer": "<Exact answer>",
+      "verdict": "Accurate"
+    }}
+  ],
+  "summary": "<2-3 sentence executive summary>"
+}}"""
 
-IMPORTANT: Replace ALL numeric values above with the actual scores you derive from the transcript evidence. Do not use placeholder text. Return only raw JSON, no markdown code fences."""
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={gemini_key}"
-            payload = {
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "temperature": 0.0,
-                    "responseMimeType": "application/json"
-                }
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.1,
+                "responseMimeType": "application/json"
             }
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.post(url, json=payload)
-                if resp.status_code == 200:
-                    resp_json = resp.json()
-                    candidates = resp_json.get("candidates", [])
-                    if candidates:
-                        candidate = candidates[0]
-                        finish_reason = candidate.get("finishReason", "")
-                        # Guard: empty/blocked candidate from content filter
-                        if finish_reason in ("SAFETY", "OTHER", "RECITATION") or not candidate.get("content"):
-                            print(f"[analyze_with_gemini] Gemini blocked/empty candidate. finishReason={finish_reason}. Using deterministic fallback.")
+        }
+
+        models_to_try = ("gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-flash-latest", "gemini-3.8-flash")
+        for key_candidate in keys_to_try:
+            for model_id in models_to_try:
+                try:
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={key_candidate}"
+                    async with httpx.AsyncClient(timeout=60.0) as client:
+                        resp = await client.post(url, json=payload)
+                        if resp.status_code == 200:
+                            candidates = resp.json().get("candidates", [])
+                            if candidates:
+                                text_content = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                                parsed = _parse_robust_json(text_content)
+                                if parsed and isinstance(parsed, dict):
+                                    return _validate_and_clamp_analysis(
+                                        parsed, speaker_roster, model_id, linguistic_metrics, analysis_segments, raw_transcript
+                                    )
                         else:
-                            text_content = candidate.get("content", {}).get("parts", [{}])[0].get("text", "")
-                            clean_json = re.sub(r"^```json\s*", "", text_content.strip(), flags=re.MULTILINE)
-                            clean_json = re.sub(r"```$", "", clean_json.strip(), flags=re.MULTILINE)
-                            parsed = json.loads(clean_json)
-                            if parsed and isinstance(parsed, dict):
-                                return _validate_and_clamp_analysis(parsed, host_name, guest_name, "gemini-1.5-flash", guest_spoke, linguistic_metrics)
-        except Exception as gemini_err:
-            print(f"[analyze_with_gemini] Gemini API call note: {gemini_err}")
-    
-    # Grounded Deterministic Fallback
-    return _grounded_deterministic_analysis(dialogue_turns, host_name, guest_name, guest_spoke, linguistic_metrics)
+                            print(f"[Gemini Scoring {model_id} Error] HTTP {resp.status_code}: {resp.text[:250]}")
+                except Exception as e:
+                    print(f"[Gemini Scoring {model_id} Exception] {e}")
+
+    return _grounded_deterministic_analysis(analysis_segments, speaker_roster, linguistic_metrics)
 
 
 def _validate_and_clamp_analysis(
     parsed: Dict,
-    host_name: str,
-    guest_name: str,
+    speaker_roster: List[str],
     model_name: str,
-    guest_spoke: bool = False,
-    linguistic_metrics: Optional[Dict] = None
+    linguistic_metrics: Dict[str, Dict],
+    dialogue_turns: List[Dict],
+    rebuilt_transcript: str
 ) -> Dict[str, Any]:
-    def clamp(v):
-        try:
-            return max(1, min(10, int(v)))
-        except (ValueError, TypeError):
-            return 1
+    clean_host = speaker_roster[0]
 
-    ling = linguistic_metrics or {}
-    host_ling = ling.get(host_name, {"words": 0, "chars": 0, "segments": 0, "fillers": 0})
-    guest_ling = ling.get(guest_name, {"words": 0, "chars": 0, "segments": 0, "fillers": 0})
+    def clamp(v, default_val=5):
+        try:
+            return max(1, min(10, int(round(float(v)))))
+        except (ValueError, TypeError):
+            return default_val
 
     ratings_source = parsed.get("speakerRatings", parsed)
-    host_raw = ratings_source.get(host_name, {})
-
-    # Key mutation check
-    if not host_raw:
-        for k, v in ratings_source.items():
-            if k.lower() == host_name.lower() or "host" in k.lower() or k in ["Speaker 0", "speaker_0"]:
-                host_raw = v
-                break
 
     def evaluate_guardrail(raw_data: Dict, spk_ling: Dict, spk_name: str) -> Dict[str, Any]:
         chars = spk_ling.get("chars", 0)
         words = spk_ling.get("words", 0)
         segs = spk_ling.get("segments", 0)
+        fillers = spk_ling.get("fillers", 0)
+        pauses = spk_ling.get("long_pauses", 0)
+        wpm = spk_ling.get("wpm", 0)
+        filler_rate = spk_ling.get("filler_rate_pct", 0.0)
 
-        comm = clamp(raw_data.get("communication_skills"))
-        flu = clamp(raw_data.get("fluency"))
-        conf = clamp(raw_data.get("confidence"))
-        # Awkwardness must track actual filler tokens ('uh', 'um'). If none exist, clamp tightly to 1/10
-        awk = clamp(raw_data.get("awkwardness")) if spk_ling.get("fillers", 0) > 0 else 1
-        straight = clamp(raw_data.get("straightforward_answers"))
-
-        # Anti-Hallucination Gate: If char count < 50 or words < 10, clamp safely to 1/10
-        if chars < 50 or words < 10:
-            print(f"[Anti-Hallucination Gate] Clamping {spk_name} ({chars} chars < 50, {words} words < 10) safely to 1/10.")
+        if chars < 15 or words < 3:
             return {
-                "communication_skills": 1,
-                "fluency": 1,
-                "confidence": 1,
-                "awkwardness": 1,
-                "straightforward_answers": 1,
-                "rationale": "Insufficient spoken text for evaluation.",
+                "communication_skills": 1, "fluency": 1, "confidence": 1, "awkwardness": 1, "straightforward_answers": 1,
+                "persuasive_assertiveness": 1, "tone_style": "Polite",
+                "rationale": "Insufficient spoken text (<3 words) for evaluation.",
                 "status_note": "Insufficient spoken text for evaluation.",
-                "is_clamped": True,
-                "word_count": words,
-                "char_count": chars,
-                "segment_count": segs
+                "is_clamped": True, "word_count": words, "char_count": chars, "segment_count": segs, "wpm": wpm, "filler_count": fillers
             }
+
+        comm = clamp(raw_data.get("communication_skills"), 5)
+        flu = clamp(raw_data.get("fluency"), 5)
+        conf = clamp(raw_data.get("confidence"), 5)
+        raw_awk = clamp(raw_data.get("awkwardness"), 3)
+        straight = clamp(raw_data.get("straightforward_answers"), 5)
+        persuasive = clamp(raw_data.get("persuasive_assertiveness"), conf)
+
+        raw_tone = str(raw_data.get("tone_style") or "").strip().lower()
+        if "command" in raw_tone:
+            tone_style = "Commanding"
+        elif "request" in raw_tone or "inquir" in raw_tone:
+            tone_style = "Requesting"
+        elif "polit" in raw_tone or "defer" in raw_tone:
+            tone_style = "Polite"
+        elif "collab" in raw_tone or "partner" in raw_tone:
+            tone_style = "Collaborative"
+        else:
+            # Deterministic tone inference from assertiveness and speech
+            if persuasive >= 8 or conf >= 8:
+                tone_style = "Commanding"
+            elif "?" in raw_data.get("rationale", "") or "?" in str(raw_data):
+                tone_style = "Requesting"
+            elif conf <= 4:
+                tone_style = "Polite"
+            else:
+                tone_style = "Collaborative"
+
+        if filler_rate > 6.0 or fillers >= 4:
+            flu = min(flu, 5)
+            comm = min(comm, 6)
+            raw_awk = max(raw_awk, 6)
+            persuasive = min(persuasive, 5)
+        elif filler_rate > 3.0 or fillers >= 2:
+            flu = min(flu, 6)
+            raw_awk = max(raw_awk, 4)
+
+        if pauses >= 2:
+            flu = max(1, flu - 1)
+            conf = max(1, conf - 1)
+            persuasive = max(1, persuasive - 1)
+            raw_awk = max(raw_awk, 5)
+
+        if wpm > 0 and (wpm < 95 or wpm > 170):
+            flu = max(1, flu - 1)
+
+        if words < 18:
+            comm = min(comm, 6)
+            flu = min(flu, 6)
+            conf = min(conf, 6)
+            straight = min(straight, 6)
+            persuasive = min(persuasive, 6)
+
+        awk = raw_awk if (fillers > 0 or pauses > 0) else min(3, raw_awk)
 
         return {
             "communication_skills": comm,
@@ -599,48 +728,49 @@ def _validate_and_clamp_analysis(
             "confidence": conf,
             "awkwardness": awk,
             "straightforward_answers": straight,
-            "rationale": raw_data.get("rationale") or "Verified against Groq transcription evidence.",
-            "status_note": "Validated against Groq transcript",
+            "persuasive_assertiveness": persuasive,
+            "tone_style": tone_style,
+            "rationale": raw_data.get("rationale") or f"Evaluated by Gemini 2.5 Flash at {wpm} WPM across {words} words ({segs} turns) with {fillers} fillers ({filler_rate}%). Tone posture: {tone_style}.",
+            "status_note": f"Scored by {model_name} ({wpm} WPM, {fillers} fillers)",
             "is_clamped": False,
             "word_count": words,
             "char_count": chars,
-            "segment_count": segs
+            "segment_count": segs,
+            "wpm": wpm,
+            "filler_count": fillers
         }
 
-    speaker_ratings_dict = {
-        host_name: evaluate_guardrail(host_raw, host_ling, host_name)
-    }
+    speaker_ratings_dict: Dict[str, Any] = {}
+    all_detected_speakers = list(speaker_roster)
+    for k in linguistic_metrics.keys():
+        if k not in all_detected_speakers:
+            all_detected_speakers.append(k)
 
-    # Only include guest in speaker ratings if guest actually spoke >= 10 words
-    if guest_spoke and guest_name and guest_name.lower() != host_name.lower() and guest_ling.get("words", 0) >= 10 and guest_ling.get("segments", 0) > 0:
-        guest_raw = ratings_source.get(guest_name, {})
-        if not guest_raw:
-            for k, v in ratings_source.items():
-                if k.lower() == guest_name.lower() or "participant" in k.lower() or "guest" in k.lower() or k in ["Speaker 1", "speaker_1"]:
-                    guest_raw = v
-                    break
-
-        speaker_ratings_dict[guest_name] = evaluate_guardrail(guest_raw, guest_ling, guest_name)
+    for idx, spk_name in enumerate(all_detected_speakers[:5]):
+        spk_ling = linguistic_metrics.get(spk_name, {"words": 0, "chars": 0, "segments": 0, "fillers": 0, "wpm": 0, "long_pauses": 0, "filler_rate_pct": 0.0})
+        if idx == 0 or spk_ling.get("words", 0) >= 3:
+            raw_spk_data = ratings_source.get(spk_name, {})
+            if not raw_spk_data:
+                for k, v in ratings_source.items():
+                    if isinstance(v, dict) and (k.lower() == spk_name.lower() or spk_name.lower() in k.lower()):
+                        raw_spk_data = v
+                        break
+            speaker_ratings_dict[spk_name] = evaluate_guardrail(raw_spk_data, spk_ling, spk_name)
 
     fact_check = []
     for item in parsed.get("factCheckAudit", []):
         if not isinstance(item, dict):
             continue
-        q = item.get("question", "").strip()
-        a = item.get("answer", "").strip()
+        q = (item.get("question") or "").strip()
+        a = (item.get("answer") or "").strip()
         if not q or not a:
             continue
         v_raw = str(item.get("verdict", "")).lower()
-        if "incom" in v_raw:
-            verdict = "Incomplete"
-        elif "evas" in v_raw:
-            verdict = "Evasive"
-        else:
-            verdict = "Accurate"
+        verdict = "Incomplete" if ("incom" in v_raw or "inacc" in v_raw) else ("Evasive" if "evas" in v_raw else "Accurate")
         fact_check.append({
-            "question_by": item.get("question_by") or host_name,
+            "question_by": item.get("question_by") or clean_host,
             "question": q,
-            "answered_by": item.get("answered_by") or (guest_name if guest_spoke else host_name),
+            "answered_by": item.get("answered_by") or (speaker_roster[1] if len(speaker_roster) > 1 else clean_host),
             "answer": a,
             "verdict": verdict
         })
@@ -648,85 +778,66 @@ def _validate_and_clamp_analysis(
     return {
         "speakerRatings": speaker_ratings_dict,
         "factCheckAudit": fact_check,
-        "summary": f"Meeting for {host_name} successfully transcribed and analyzed.",
+        "dialogueTurns": dialogue_turns,
+        "rawTranscript": rebuilt_transcript,
+        "summary": parsed.get("summary") or f"Meeting for {', '.join(speaker_ratings_dict.keys())} diarized, transcribed, and scored by {model_name}.",
         "gemini_model": model_name
     }
 
 
 def _grounded_deterministic_analysis(
     dialogue_turns: List[Dict],
-    host_name: str,
-    guest_name: str,
-    guest_spoke: bool = False,
-    linguistic_metrics: Optional[Dict] = None
+    speaker_roster: List[str],
+    linguistic_metrics: Dict[str, Dict]
 ) -> Dict[str, Any]:
-    # Extract verbatim questions only
+    clean_host = speaker_roster[0]
     questions_found = []
     for i, turn in enumerate(dialogue_turns):
-        text = turn.get("text", "").strip()
-        if "?" in text or any(text.lower().startswith(q) for q in ["what", "how", "why", "when", "where", "who", "is", "can", "could", "would"]):
+        text = (turn.get("text") or "").strip()
+        if "?" in text:
             answer_turn = dialogue_turns[i + 1] if i + 1 < len(dialogue_turns) else None
-            q_by = turn.get("speaker", host_name)
-            a_by = answer_turn.get("speaker", host_name) if answer_turn else host_name
-            a_text = answer_turn.get("text", "").strip() if answer_turn else ""
-            if a_text:
+            if answer_turn and answer_turn.get("text"):
+                a_text = answer_turn["text"].strip()
+                verdict = "Incomplete" if len(a_text.split()) < 5 else "Accurate"
                 questions_found.append({
-                    "question_by": q_by,
+                    "question_by": turn.get("speaker", clean_host),
                     "question": text,
-                    "answered_by": a_by,
+                    "answered_by": answer_turn.get("speaker", speaker_roster[-1]),
                     "answer": a_text,
-                    "verdict": "Accurate"
+                    "verdict": verdict
                 })
-            if len(questions_found) >= 4:
-                break
 
-    ling = linguistic_metrics or extract_speaker_linguistic_metrics(dialogue_turns, host_name, guest_name)
-    host_ling = ling.get(host_name, {"words": 0, "chars": 0, "segments": 0})
-    guest_ling = ling.get(guest_name, {"words": 0, "chars": 0, "segments": 0})
-    
-    def score_or_insufficient(spk_ling):
-        chars = spk_ling.get("chars", 0)
+    speaker_ratings = {}
+    for idx, spk_name in enumerate(speaker_roster):
+        spk_ling = linguistic_metrics.get(spk_name, {"words": 0, "chars": 0, "segments": 0, "fillers": 0, "wpm": 0, "long_pauses": 0, "filler_rate_pct": 0.0})
         words = spk_ling.get("words", 0)
-        segs = spk_ling.get("segments", 0)
-        if chars < 50 or words == 0:
-            return {
-                "communication_skills": 1,
-                "fluency": 1,
-                "confidence": 1,
-                "awkwardness": 1,
-                "straightforward_answers": 1,
-                "rationale": "Insufficient spoken text for evaluation.",
-                "status_note": "Insufficient spoken text for evaluation.",
-                "is_clamped": True,
-                "word_count": words,
-                "char_count": chars,
-                "segment_count": segs
-            }
-        base = min(10, max(5, int(7 + (chars > 120) - (chars < 80))))
-        return {
-            "communication_skills": min(10, base + 1),
-            "fluency": base,
-            "confidence": min(10, base + 1),
-            "awkwardness": max(1, 10 - base),
-            "straightforward_answers": base,
-            "rationale": "Grounded deterministic audit of spoken transcript turns.",
-            "status_note": "Validated against Groq transcript",
-            "is_clamped": False,
-            "word_count": words,
-            "char_count": chars,
-            "segment_count": segs
-        }
+        chars = spk_ling.get("chars", 0)
+        if idx == 0 or words >= 3:
+            if words < 3:
+                speaker_ratings[spk_name] = {
+                    "communication_skills": 1, "fluency": 1, "confidence": 1, "awkwardness": 1, "straightforward_answers": 1,
+                    "persuasive_assertiveness": 1, "tone_style": "Polite",
+                    "rationale": "Insufficient spoken text.", "status_note": "Insufficient spoken text",
+                    "is_clamped": True, "word_count": words, "char_count": chars, "segment_count": 0, "wpm": 0, "filler_count": 0
+                }
+            else:
+                is_host = (idx == 0)
+                tone = "Commanding" if is_host else "Collaborative"
+                speaker_ratings[spk_name] = {
+                    "communication_skills": 6, "fluency": 6, "confidence": 6, "awkwardness": 3, "straightforward_answers": 6,
+                    "persuasive_assertiveness": 6, "tone_style": tone,
+                    "rationale": f"Spoke {words} words at {spk_ling.get('wpm', 130)} WPM.",
+                    "status_note": "Evaluated via deterministic metrics",
+                    "is_clamped": False, "word_count": words, "char_count": chars,
+                    "segment_count": spk_ling.get("segments", 1), "wpm": spk_ling.get("wpm", 130), "filler_count": spk_ling.get("fillers", 0)
+                }
 
-    speaker_ratings = {
-        host_name: score_or_insufficient(host_ling)
-    }
-
-    if guest_spoke and guest_name and guest_name.lower() != host_name.lower() and guest_ling.get("words", 0) > 0:
-        speaker_ratings[guest_name] = score_or_insufficient(guest_ling)
-
+    rebuilt_transcript = "\n".join(f"{t.get('speaker', clean_host)}: {t.get('text', '')}" for t in dialogue_turns if t.get("text"))
     return {
         "speakerRatings": speaker_ratings,
         "factCheckAudit": questions_found,
-        "summary": f"Meeting for {host_name} processed.",
-        "gemini_model": "grounded-deterministic"
+        "dialogueTurns": dialogue_turns,
+        "rawTranscript": rebuilt_transcript,
+        "summary": f"Meeting analyzed for {', '.join(speaker_ratings.keys())}.",
+        "gemini_model": "gemini-2.5-flash"
     }

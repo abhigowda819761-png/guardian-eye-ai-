@@ -121,13 +121,14 @@ function saveLocalUser(email, password, displayName = '') {
   }
 }
 
-export async function loginUser(emailOrUsername, password) {
+export async function loginUser(emailOrUsername, password, customDisplayName = '') {
   const raw = (emailOrUsername || '').trim().toLowerCase();
   if (!raw) {
     throw new Error("Please enter your Gmail ID.");
   }
   const cleanEmail = raw.includes('@') ? raw : `${raw}@gmail.com`;
   const pwd = (password || '').trim();
+  const explicitDisplayName = (customDisplayName || '').trim();
 
   if (!pwd) {
     throw new Error("Please enter your password.");
@@ -151,9 +152,10 @@ export async function loginUser(emailOrUsername, password) {
         }
       }
 
+      const dispName = explicitDisplayName || userCredential.user.displayName || cleanEmail.split('@')[0];
       return {
         uid: userCredential.user.uid,
-        displayName: userCredential.user.displayName || cleanEmail.split('@')[0].toUpperCase(),
+        displayName: dispName,
         email: userCredential.user.email
       };
     } catch (err) {
@@ -182,9 +184,11 @@ export async function loginUser(emailOrUsername, password) {
       body: JSON.stringify({ email: cleanEmail, password: pwd })
     }).catch(() => {});
 
+    const dispName = explicitDisplayName || stored.displayName || cleanEmail.split('@')[0];
+    saveLocalUser(cleanEmail, pwd, dispName);
     return {
       uid: 'user-' + cleanEmail,
-      displayName: stored.displayName || cleanEmail.split('@')[0].toUpperCase(),
+      displayName: dispName,
       email: cleanEmail
     };
   }
@@ -214,7 +218,7 @@ export async function loginUser(emailOrUsername, password) {
       data = await res.json().catch(() => ({}));
     }
 
-    const dispName = (data && data.user && data.user.displayName) || cleanEmail.split('@')[0].toUpperCase();
+    const dispName = explicitDisplayName || (data && data.user && data.user.displayName) || cleanEmail.split('@')[0];
     saveLocalUser(cleanEmail, pwd, dispName);
     return {
       uid: (data && data.user && data.user.email) || cleanEmail,
@@ -229,7 +233,7 @@ export async function loginUser(emailOrUsername, password) {
     }
 
     // 4. First time sign-in when backend is offline/unreachable: register credentials locally
-    const dispName = cleanEmail.split('@')[0].toUpperCase();
+    const dispName = explicitDisplayName || cleanEmail.split('@')[0];
     saveLocalUser(cleanEmail, pwd, dispName);
     return {
       uid: 'user-' + cleanEmail,
@@ -249,7 +253,7 @@ export async function registerUser(email, password, displayName = '') {
     throw new Error("Password must be at least 6 characters long.");
   }
 
-  const dispName = (displayName || '').trim() || cleanEmail.split('@')[0].toUpperCase();
+  const dispName = (displayName || '').trim() || cleanEmail.split('@')[0];
 
   // 1. Firebase Auth & Firestore User Store
   if (isFirebaseConfigured && auth) {
@@ -597,8 +601,8 @@ export async function triggerGenerateMeetingTranscription({ meetingId, storagePa
     console.warn('[Backend] generateMeetingTranscription fallback note:', err.message);
   }
 
-  const defaultHost = hostName || 'ABHIGOWDA819761';
-  const defaultGuest = (participantNames && participantNames[0]) || 'Participant';
+  const defaultHost = (hostName && hostName.trim()) ? hostName.trim() : 'Host';
+  const defaultGuest = (participantNames && participantNames[0]) || 'Participant 1';
   return {
     success: false,
     error: 'Acoustic voice data could not be parsed from this video track.',
@@ -623,28 +627,36 @@ export async function triggerGenerateMeetingTranscription({ meetingId, storagePa
 
 /**
  * Direct Real-World Video Footage Analysis:
- * Sends the actual video file (blob/mp4/webm) to the backend pipeline:
+ * Sends the actual video file (blob/mp4/webm) to the 100% Native Google Gemini 2.5 Flash Audio Pipeline:
  * 1. Extracts 16kHz mono audio via FFmpeg
- * 2. Transcribes via Groq OpenAI Whisper Large-V3 (or local faster-whisper)
- * 3. Evaluates speaker ratings & fact-check audit via Google Gemini 1.5 Flash
+ * 2. Transcribes & diarizes ('Who Spoke What') natively via Google Gemini (Primary Key)
+ * 3. Evaluates 1-10 speaker ratings & audits fact-checking via Google Gemini (Secondary Key)
  */
-export async function analyzeVideoWithGroqAndGemini(file, { meetingId, hostName, participantNames, onProgress } = {}) {
+export async function analyzeVideoWithGemini(file, { meetingId, hostName, participantNames, onProgress } = {}) {
   const cleanMeetingId = meetingId || `meeting_${Date.now()}`;
-  const cleanHost = hostName || 'Host';
-  const cleanGuest = (participantNames && participantNames[0]) || 'Participant';
+  const cleanHost = (hostName && hostName.trim()) ? hostName.trim() : 'Host';
+  const cleanParticipantsList = Array.isArray(participantNames)
+    ? participantNames.map(p => String(p).trim()).filter(Boolean).slice(0, 4)
+    : (typeof participantNames === 'string' && participantNames.trim()
+        ? participantNames.split(',').map(p => p.trim()).filter(Boolean).slice(0, 4)
+        : ['Participant 1']);
 
-  const formData = new FormData();
-  formData.append('file', file, file.name || `${cleanMeetingId}.webm`);
-  formData.append('meetingId', cleanMeetingId);
-  formData.append('hostName', cleanHost);
-  formData.append('participantNames', cleanGuest);
+  const createFormData = () => {
+    const fd = new FormData();
+    fd.append('file', file, file.name || `${cleanMeetingId}.mp4`);
+    fd.append('meetingId', cleanMeetingId);
+    fd.append('hostName', cleanHost);
+    fd.append('participantNames', JSON.stringify(cleanParticipantsList));
+    return fd;
+  };
 
+  // Prioritize same-origin Vite proxy (/api/...) first to avoid CORS / PNA / IPv6 connection issues!
   const candidateUrls = [
-    `${API_BASE_URL}/api/meeting/analyze-video`,
-    `http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:8000/api/meeting/analyze-video`,
+    '/api/meeting/analyze-video',
+    `${API_BASE_URL ? API_BASE_URL.replace(/\/+$/, '') : ''}/api/meeting/analyze-video`,
+    'http://127.0.0.1:8000/api/meeting/analyze-video',
     'http://localhost:8000/api/meeting/analyze-video',
-    'http://10.102.167.95:8000/api/meeting/analyze-video',
-    'https://backend-six-gamma-mofll82e7o.vercel.app/api/meeting/analyze-video'
+    `http://${typeof window !== 'undefined' ? window.location.hostname : 'localhost'}:8000/api/meeting/analyze-video`
   ].filter((u, i, a) => u && a.indexOf(u) === i);
 
   let lastError = null;
@@ -653,29 +665,35 @@ export async function analyzeVideoWithGroqAndGemini(file, { meetingId, hostName,
       if (onProgress) onProgress(25);
       const res = await fetch(url, {
         method: 'POST',
-        body: formData
+        body: createFormData()
       });
       if (res.ok) {
         if (onProgress) onProgress(90);
         const data = await res.json();
-        if (data && data.success) {
+        if (data && (data.success || data.rawTranscript || data.dialogueTurns)) {
           if (onProgress) onProgress(100);
           return data;
         }
+      } else {
+        const errData = await res.json().catch(() => ({}));
+        const msg = errData.detail || errData.error || errData.message || `Backend HTTP ${res.status}`;
+        throw new Error(msg);
       }
     } catch (err) {
       lastError = err;
-      console.warn(`[analyzeVideoWithGroqAndGemini] Note on ${url}:`, err.message);
+      console.warn(`[analyzeVideoWithGemini] Endpoint ${url} note:`, err.message);
+      // If the server explicitly rejected the payload with an application error (not a network connection failure), do not overwrite it
+      if (err.message && !err.message.includes('Failed to fetch') && !err.message.includes('NetworkError')) {
+        throw err;
+      }
     }
   }
 
-  // Fallback to triggerGenerateMeetingTranscription if direct endpoint unreachable
-  return await triggerGenerateMeetingTranscription({
-    meetingId: cleanMeetingId,
-    hostName: cleanHost,
-    participantNames: [cleanGuest]
-  });
+  throw lastError || new Error('Failed to reach FastAPI backend at http://localhost:8000/api/meeting/analyze-video');
 }
+
+// Backward-compatibility export
+export const analyzeVideoWithGroqAndGemini = analyzeVideoWithGemini;
 
 /**
  * Step 3: Trigger HTTPS callable Cloud Function 'analyzeMeetingRatings' (Google Gemini 1.5 Flash)
@@ -728,7 +746,7 @@ export async function triggerAnalyzeMeetingRatings({ meetingId, rawTranscript, h
       [host]: { communication_skills: 1, fluency: 1, confidence: 1, awkwardness: 1, straightforward_answers: 1, rationale: 'Insufficient data in raw video' },
       [guest]: { communication_skills: 1, fluency: 1, confidence: 1, awkwardness: 1, straightforward_answers: 1, rationale: 'Insufficient data in raw video' }
     },
-    model: 'gemini-1.5-flash'
+    model: 'gemini-2.5-flash'
   };
 }
 
@@ -778,7 +796,7 @@ export async function triggerAuditMeetingFactCheck({ meetingId, rawTranscript, h
     success: true,
     meetingId: String(meetingId),
     factCheckAudit: [],
-    model: 'gemini-1.5-flash'
+    model: 'gemini-2.5-flash'
   };
 }
 
