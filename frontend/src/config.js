@@ -70,9 +70,23 @@ export const STUN_SERVERS = [
   { urls: 'stun:stun2.l.google.com:19302' },
   { urls: 'stun:stun3.l.google.com:19302' },
   { urls: 'stun:stun4.l.google.com:19302' },
-  { urls: 'stun:stun.services.mozilla.com' },
   { urls: 'stun:stun.cloudflare.com:3478' },
-  { urls: 'stun:stun.sipgate.net:3478' }
+  // OpenRelay Public TURN Relay fallback for strict NAT / mobile firewall traversal
+  {
+    urls: 'turn:openrelay.metered.ca:80',
+    username: 'openrelay',
+    credential: 'openrelay'
+  },
+  {
+    urls: 'turn:openrelay.metered.ca:443',
+    username: 'openrelay',
+    credential: 'openrelay'
+  },
+  {
+    urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+    username: 'openrelay',
+    credential: 'openrelay'
+  }
 ];
 
 // Retain alias for backward compatibility
@@ -89,10 +103,13 @@ export const ADVANCED_RTC_CONFIG = {
 };
 
 // ── 3. PeerJS Client Configuration ────────────────────────────────────────────
-const defaultPeerHost = import.meta.env.VITE_PEER_HOST || (isLocal ? window.location.hostname : undefined);
+// Automatically bind to the active origin/proxy so signaling never drops or hits rate-limited public servers
+const defaultPeerHost = import.meta.env.VITE_PEER_HOST || (typeof window !== 'undefined' ? window.location.hostname : undefined);
 const defaultPeerPort = import.meta.env.VITE_PEER_PORT 
   ? Number(import.meta.env.VITE_PEER_PORT) 
-  : (isLocal ? (window.location.protocol === 'https:' ? (window.location.port ? Number(window.location.port) : 5173) : 9000) : undefined);
+  : (typeof window !== 'undefined'
+      ? (window.location.port ? Number(window.location.port) : (window.location.protocol === 'https:' ? 443 : 80))
+      : undefined);
 const defaultPeerPath = import.meta.env.VITE_PEER_PATH || '/peerjs';
 
 export const PEER_OPTIONS = {
@@ -102,7 +119,7 @@ export const PEER_OPTIONS = {
     host: defaultPeerHost,
     port: defaultPeerPort,
     path: defaultPeerPath,
-    secure: window.location.protocol === 'https:'
+    secure: typeof window !== 'undefined' ? window.location.protocol === 'https:' : true
   } : {})
 };
 

@@ -818,12 +818,12 @@ function MeetingRoom({
           setIsWaitingForApproval(false);
           upsertPeer('__self__', { approved: true });
 
-          // Call host or existing peers
+          // Call other existing peers (NOT the host, as host already initiates the call to this guest)
           if (data.existingPeers && Array.isArray(data.existingPeers)) {
             data.existingPeers.forEach(ep => {
               if (ep.id !== peerInstanceRef.current?.id) {
                 upsertPeer(ep.id, { name: ep.name, role: ep.role });
-                if (streamRef.current && peerInstanceRef.current && !callsRef.current[ep.id]) {
+                if (ep.role !== 'host' && streamRef.current && peerInstanceRef.current && !callsRef.current[ep.id]) {
                   const call = peerInstanceRef.current.call(ep.id, streamRef.current, {
                     sdpTransform: (sdp) => optimizeSdp(sdp, 500)
                   });
@@ -845,7 +845,9 @@ function MeetingRoom({
 
         // Participant notified of another participant joining
         case 'participant_joined': {
-          upsertPeer(data.peerId, { name: data.name, role: 'participant' });
+          if (data.peerId && data.peerId !== peerInstanceRef.current?.id) {
+            upsertPeer(data.peerId, { name: data.name, role: 'participant' });
+          }
           break;
         }
 
@@ -973,21 +975,31 @@ function MeetingRoom({
         });
 
         // Listen for incoming media calls
-        peer.on('call', (call) => {
+        peer.on('call', async (call) => {
           if (!alive) return;
           console.log('[PeerJS] Incoming call from:', call.peer);
-          // Answer with local media stream if available, applying H264/VP8 codec priority & 500kbps bitrate cap
-          if (streamRef.current) {
-            call.answer(streamRef.current, {
+
+          // Ensure local stream is ready before answering
+          let activeStream = streamRef.current;
+          if (!activeStream) {
+            console.log('[PeerJS] Local stream not ready yet, acquiring before answering call...');
+            try {
+              activeStream = await startMedia();
+            } catch (err) {
+              console.warn('[PeerJS] Error acquiring local stream for call:', err);
+            }
+          }
+
+          if (activeStream) {
+            call.answer(activeStream, {
               sdpTransform: (sdp) => optimizeSdp(sdp, 500)
             });
           } else {
-            // Answer with empty audio/video if camera not yet initialized
             call.answer(undefined, {
               sdpTransform: (sdp) => optimizeSdp(sdp, 500)
             });
           }
-          setupCall(call, 'Participant', 'guest');
+          setupCall(call, isGuest ? (hostName || 'Host') : 'Participant', isGuest ? 'host' : 'guest');
         });
 
         peer.on('error', (err) => {
@@ -1082,11 +1094,13 @@ function MeetingRoom({
     // 2. Send knock_approved via data connection
     const conn = dataConnsRef.current[id];
     if (conn && conn.open) {
-      const existingPeersList = peersRef.current.map(p => ({
-        id: p.id,
-        name: p.name,
-        role: p.role
-      }));
+      const existingPeersList = peersRef.current
+        .filter(p => p.id !== '__self__' && p.id !== id)
+        .map(p => ({
+          id: p.id,
+          name: p.name,
+          role: p.role
+        }));
       // Include host in the list
       existingPeersList.push({
         id: peerInstanceRef.current?.id,
@@ -1111,11 +1125,17 @@ function MeetingRoom({
       }
     }
 
-    // 4. Notify other peers about the new participant
-    broadcastData({
-      type: 'participant_joined',
-      peerId: id,
-      name: joinRequests.find(r => r.id === id)?.name || 'Guest'
+    // 4. Notify other peers about the new participant (excluding the new participant to prevent duplicate self-tiles)
+    Object.entries(dataConnsRef.current).forEach(([connPeerId, connObj]) => {
+      if (connPeerId !== id && connObj && connObj.open) {
+        try {
+          connObj.send({
+            type: 'participant_joined',
+            peerId: id,
+            name: joinRequests.find(r => r.id === id)?.name || 'Guest'
+          });
+        } catch (e) {}
+      }
     });
 
     setJoinRequests(prev => prev.filter(r => r.id !== id));
