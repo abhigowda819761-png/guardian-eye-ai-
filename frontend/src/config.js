@@ -90,7 +90,9 @@ export const ADVANCED_RTC_CONFIG = {
 
 // ── 3. PeerJS Client Configuration ────────────────────────────────────────────
 const defaultPeerHost = import.meta.env.VITE_PEER_HOST || (isLocal ? window.location.hostname : undefined);
-const defaultPeerPort = import.meta.env.VITE_PEER_PORT ? Number(import.meta.env.VITE_PEER_PORT) : (isLocal ? 9000 : undefined);
+const defaultPeerPort = import.meta.env.VITE_PEER_PORT 
+  ? Number(import.meta.env.VITE_PEER_PORT) 
+  : (isLocal ? (window.location.protocol === 'https:' ? (window.location.port ? Number(window.location.port) : 5173) : 9000) : undefined);
 const defaultPeerPath = import.meta.env.VITE_PEER_PATH || '/peerjs';
 
 export const PEER_OPTIONS = {
