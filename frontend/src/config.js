@@ -13,7 +13,7 @@ export const isNativePlatform = typeof window !== 'undefined' && Boolean(
 );
 
 // 2. Live Render.com Production Cloud Endpoint
-export const RENDER_PRODUCTION_URL = 'https://guardian-eye-ai-backend.onrender.com';
+export const RENDER_PRODUCTION_URL = 'https://guardian-eye-ai-1.onrender.com';
 
 // 3. Local desktop browser development check (Only true on desktop browser localhost, never in native APK)
 export const isLocalDesktop = typeof window !== 'undefined' && !isNativePlatform && (
