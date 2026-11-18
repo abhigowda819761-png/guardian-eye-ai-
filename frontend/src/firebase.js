@@ -170,13 +170,10 @@ export async function loginUser(emailOrUsername, password, customDisplayName = '
     }
   }
 
-  // 2. Local check: If this Gmail ID has been registered / saved on this device, strictly check password
+  // 2. Fast-path local check: If local cache has matching credentials, authenticate immediately
   const localUsers = getLocalUsers();
-  if (localUsers[cleanEmail]) {
+  if (localUsers[cleanEmail] && localUsers[cleanEmail].password === pwd) {
     const stored = localUsers[cleanEmail];
-    if (stored.password !== pwd) {
-      throw new Error("Invalid password");
-    }
     // Password is valid! Also notify/sync with backend in background
     fetch(`${API_BASE_URL}/api/auth/login`, {
       method: 'POST',
@@ -193,7 +190,7 @@ export async function loginUser(emailOrUsername, password, customDisplayName = '
     };
   }
 
-  // 3. If not found locally, query backend authentication service
+  // 3. Query backend authentication service (checks database / cloud API)
   try {
     const res = await fetch(`${API_BASE_URL}/api/auth/login`, {
       method: 'POST',
