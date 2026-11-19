@@ -298,8 +298,8 @@ Return ONLY valid JSON matching this exact schema:
 
         import httpx
         raw_segments: List[Dict[str, Any]] = []
-        used_model = "gemini-3.5-flash"
-        models_to_try = ("gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-flash-latest", "gemini-3.8-flash")
+        used_model = "gemini-3.5-flash-lite"
+        models_to_try = ("gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.5-flash", "gemini-3.8-flash", "gemini-flash-latest")
 
         for key_candidate in keys_to_try:
             if raw_segments:
@@ -415,7 +415,7 @@ async def generate_gemini_summary(raw_transcript: str, gemini_api_key: Optional[
             "generationConfig": {"temperature": 0.1, "maxOutputTokens": 200}
         }
         for key_candidate in keys_to_try:
-            for model_id in ("gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-flash-latest", "gemini-3.8-flash"):
+            for model_id in ("gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.5-flash", "gemini-3.8-flash", "gemini-flash-latest"):
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={key_candidate}"
                 try:
                     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -608,7 +608,7 @@ Return ONLY valid JSON matching this schema:
             }
         }
 
-        models_to_try = ("gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-flash-latest", "gemini-3.8-flash")
+        models_to_try = ("gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.5-flash", "gemini-3.8-flash", "gemini-flash-latest")
         for key_candidate in keys_to_try:
             for model_id in models_to_try:
                 try:

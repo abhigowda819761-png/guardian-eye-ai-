@@ -130,82 +130,9 @@ export const PEER_OPTIONS = {
  * - Enforce dynamic bitrate capping (Max 500kbps per video stream) via b=AS and b=TIAS.
  */
 export function optimizeSdp(sdp, maxBitrateKbps = 500) {
-  if (!sdp || typeof sdp !== 'string') return sdp;
-
-  const lines = sdp.split(/\r\n|\r|\n/);
-  const modifiedLines = [];
-  let inVideoSection = false;
-  let mVideoLineIndex = -1;
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-
-    if (line.startsWith('m=video')) {
-      inVideoSection = true;
-      mVideoLineIndex = modifiedLines.length;
-      modifiedLines.push(line);
-      continue;
-    } else if (line.startsWith('m=')) {
-      inVideoSection = false;
-    }
-
-    // Strip out pre-existing video bandwidth caps to ensure clean injection
-    if (inVideoSection && (line.startsWith('b=AS:') || line.startsWith('b=TIAS:'))) {
-      continue;
-    }
-
-    modifiedLines.push(line);
-  }
-
-  // Inject Bitrate Capping in video section
-  if (mVideoLineIndex !== -1) {
-    let insertIdx = mVideoLineIndex + 1;
-    // If followed by connection line c=IN IP4 ..., place right after it
-    if (insertIdx < modifiedLines.length && modifiedLines[insertIdx].startsWith('c=')) {
-      insertIdx++;
-    }
-    modifiedLines.splice(
-      insertIdx,
-      0,
-      `b=AS:${maxBitrateKbps}`,
-      `b=TIAS:${maxBitrateKbps * 1000}`
-    );
-  }
-
-  // Reorder payload types in m=video line to prioritize H264 (1st) and VP8 (2nd)
-  const videoIdx = modifiedLines.findIndex(l => l.startsWith('m=video'));
-  if (videoIdx !== -1) {
-    const parts = modifiedLines[videoIdx].split(' ');
-    const header = parts.slice(0, 3); // ['m=video', port, proto]
-    const payloads = parts.slice(3);
-
-    const h264List = [];
-    const vp8List = [];
-    const otherList = [];
-
-    payloads.forEach(pt => {
-      const rtpmap = modifiedLines.find(l => l.startsWith(`a=rtpmap:${pt} `));
-      if (rtpmap) {
-        const upper = rtpmap.toUpperCase();
-        if (upper.includes('H264/')) {
-          h264List.push(pt);
-        } else if (upper.includes('VP8/')) {
-          vp8List.push(pt);
-        } else {
-          otherList.push(pt);
-        }
-      } else {
-        otherList.push(pt);
-      }
-    });
-
-    const reordered = [...h264List, ...vp8List, ...otherList];
-    if (reordered.length === payloads.length && reordered.length > 0) {
-      modifiedLines[videoIdx] = [...header, ...reordered].join(' ');
-    }
-  }
-
-  return modifiedLines.join('\r\n');
+  // Use clean browser-standard SDP to guarantee 100% interoperability across devices
+  // Sender bitrate constraints are handled directly via RTCRtpSender.setParameters in applySenderConstraints
+  return sdp;
 }
 
 // ── 5. Direct RTCRtpSender Capping & Resilience Constraints ────────────────────

@@ -633,6 +633,12 @@ function MeetingRoom({
     const peerId = call.peer;
     callsRef.current[peerId] = call;
 
+    // Immediately upsert peer with known name and role so UI tile displays correctly right away
+    upsertPeer(peerId, {
+      name: defaultName,
+      role: defaultRole
+    });
+
     // ── WebRTC RTCPeerConnection Optimization & Resilience ──────────────────
     const pc = call.peerConnection;
     let statsInterval = null;
@@ -824,9 +830,7 @@ function MeetingRoom({
               if (ep.id !== peerInstanceRef.current?.id) {
                 upsertPeer(ep.id, { name: ep.name, role: ep.role });
                 if (ep.role !== 'host' && streamRef.current && peerInstanceRef.current && !callsRef.current[ep.id]) {
-                  const call = peerInstanceRef.current.call(ep.id, streamRef.current, {
-                    sdpTransform: (sdp) => optimizeSdp(sdp, 500)
-                  });
+                  const call = peerInstanceRef.current.call(ep.id, streamRef.current);
                   if (call) setupCall(call, ep.name, ep.role);
                 }
               }
@@ -979,6 +983,15 @@ function MeetingRoom({
           if (!alive) return;
           console.log('[PeerJS] Incoming call from:', call.peer);
 
+          // Find if we already know this peer's name from peersRef or joinRequests
+          const existingPeer = peersRef.current.find(p => p.id === call.peer);
+          const requestPeer = joinRequests.find(r => r.id === call.peer);
+          let peerDisplayName = existingPeer?.name || requestPeer?.name;
+          let peerRole = existingPeer?.role || (isGuest ? 'host' : 'participant');
+          if (!peerDisplayName || peerDisplayName === 'Peer') {
+            peerDisplayName = isGuest ? (meetingName ? `${meetingName} Host` : 'Host') : 'Participant';
+          }
+
           // Ensure local stream is ready before answering
           let activeStream = streamRef.current;
           if (!activeStream) {
@@ -991,15 +1004,11 @@ function MeetingRoom({
           }
 
           if (activeStream) {
-            call.answer(activeStream, {
-              sdpTransform: (sdp) => optimizeSdp(sdp, 500)
-            });
+            call.answer(activeStream);
           } else {
-            call.answer(undefined, {
-              sdpTransform: (sdp) => optimizeSdp(sdp, 500)
-            });
+            call.answer(undefined);
           }
-          setupCall(call, isGuest ? (hostName || 'Host') : 'Participant', isGuest ? 'host' : 'guest');
+          setupCall(call, peerDisplayName, peerRole);
         });
 
         peer.on('error', (err) => {
@@ -1114,11 +1123,9 @@ function MeetingRoom({
       });
     }
 
-    // 3. Initiate media call from Host to Participant with H.264/VP8 & 500kbps bitrate capping
+    // 3. Initiate media call from Host to Participant
     if (peerInstanceRef.current && streamRef.current) {
-      const call = peerInstanceRef.current.call(id, streamRef.current, {
-        sdpTransform: (sdp) => optimizeSdp(sdp, 500)
-      });
+      const call = peerInstanceRef.current.call(id, streamRef.current);
       if (call) {
         const guestName = joinRequests.find(r => r.id === id)?.name || 'Guest';
         setupCall(call, guestName, 'participant');
